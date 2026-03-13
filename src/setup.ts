@@ -346,6 +346,167 @@ function printManualConfig(): void {
 `);
 }
 
+// ── Update ───────────────────────────────────────────────────
+
+interface SkillInstallation {
+  agent: AgentDef;
+  scope: 'global' | 'local';
+  path: string;
+  exists: boolean;
+}
+
+function getPackageVersion(): string {
+  try {
+    const pkgPath = path.resolve(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    return pkg.version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function findExistingSkillInstalls(): SkillInstallation[] {
+  const agents = getAgents();
+  const installs: SkillInstallation[] = [];
+  for (const agent of agents) {
+    for (const scope of ['global', 'local'] as const) {
+      const skillDir = path.join(agent.skillBasePaths[scope], 'excalidraw-skill');
+      installs.push({
+        agent,
+        scope,
+        path: skillDir,
+        exists: fs.existsSync(path.join(skillDir, 'SKILL.md')),
+      });
+    }
+  }
+  return installs;
+}
+
+export async function runUpdate(): Promise<void> {
+  if (!process.stdin.isTTY) {
+    process.stderr.write('Error: Update requires an interactive terminal.\n');
+    process.exit(1);
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const version = getPackageVersion();
+  process.stdout.write(`\n  ${BOLD}Excalidraw MCP — Update${RESET}  ${DIM}v${version}${RESET}\n`);
+
+  try {
+    // ── Phase 1: Detect existing skill installations ──────────
+    heading('1/2', 'Skill Update');
+
+    const allInstalls = findExistingSkillInstalls();
+    const existing = allInstalls.filter(i => i.exists);
+    const missing = allInstalls.filter(i => !i.exists);
+    const detectedAgents = detectInstalledAgents();
+
+    const skillSource = path.resolve(__dirname, '..', 'skills', 'excalidraw-skill');
+    if (!fs.existsSync(skillSource)) {
+      fail(`Skill source not found at ${skillSource}`);
+      fail('This can happen with corrupted installs. Try: npx @sanjibdevnath/mcp-excalidraw-local@latest setup');
+      rl.close();
+      return;
+    }
+
+    if (existing.length > 0) {
+      process.stdout.write(`\n  Found ${CYAN}${existing.length}${RESET} existing skill installation(s):\n`);
+      existing.forEach((inst, i) => {
+        const label = `${inst.agent.name} (${inst.scope})`;
+        process.stdout.write(`    ${CYAN}[${i + 1}]${RESET} ${label} — ${DIM}${inst.path}${RESET}\n`);
+      });
+
+      const doUpdate = await confirm(rl, `\n  Update all ${existing.length} installation(s) to v${version}?`);
+      if (doUpdate) {
+        let updated = 0;
+        for (const inst of existing) {
+          try {
+            copyDirSync(skillSource, inst.path);
+            ok(`Updated ${inst.agent.name} (${inst.scope}) — ${inst.path}`);
+            updated++;
+          } catch (err) {
+            fail(`Failed to update ${inst.path}: ${(err as Error).message}`);
+          }
+        }
+        process.stdout.write(`\n    ${GREEN}${updated}/${existing.length}${RESET} skill(s) updated.\n`);
+      } else {
+        info(`${DIM}Skipped skill update.${RESET}`);
+      }
+    } else {
+      info('No existing skill installations found.');
+    }
+
+    // Offer to install for detected agents that don't have the skill
+    const agentsWithoutSkill = detectedAgents.filter(agent =>
+      !existing.some(inst => inst.agent.name === agent.name),
+    );
+
+    if (agentsWithoutSkill.length > 0) {
+      process.stdout.write(`\n  Agents without the skill:\n`);
+      agentsWithoutSkill.forEach((a, i) => {
+        process.stdout.write(`    ${YELLOW}[${i + 1}]${RESET} ${a.name}\n`);
+      });
+
+      const doInstall = await confirm(rl, 'Install the skill for these agents?');
+      if (doInstall) {
+        for (const agent of agentsWithoutSkill) {
+          const scopeAnswer = await ask(rl, `\n  ${agent.name} — scope? [G]lobal / [l]ocal: `);
+          const scope = scopeAnswer.trim().toLowerCase() === 'l' ? 'local' : 'global';
+          const destDir = path.join(agent.skillBasePaths[scope], 'excalidraw-skill');
+
+          try {
+            fs.mkdirSync(destDir, { recursive: true });
+            copyDirSync(skillSource, destDir);
+            ok(`Installed to ${destDir}`);
+          } catch (err) {
+            fail(`Failed to install to ${destDir}: ${(err as Error).message}`);
+          }
+        }
+      }
+    }
+
+    // ── Phase 2: MCP config check ────────────────────────────
+    heading('2/2', 'MCP Configuration');
+
+    const wantConfig = await confirm(rl, 'Re-apply MCP server config? (overwrites existing entry)', false);
+    if (wantConfig) {
+      for (const agent of detectedAgents) {
+        if (agent.mcpConfigType === 'json-file' && agent.mcpConfigPath) {
+          const doIt = await confirm(rl, `${agent.name} — update ${agent.mcpConfigPath}?`);
+          if (doIt) {
+            try {
+              mergeJsonConfig(agent.mcpConfigPath);
+              ok(`Updated 'excalidraw-canvas' in ${agent.mcpConfigPath}`);
+            } catch (err) {
+              fail(`Failed: ${(err as Error).message}`);
+            }
+          }
+        } else if (agent.mcpConfigType === 'cli-command' && agent.mcpCliCommand) {
+          const doIt = await confirm(rl, `${agent.name} — re-register via CLI?`);
+          if (doIt) {
+            try {
+              execSync(agent.mcpCliCommand, { stdio: 'inherit' });
+              ok(`Re-registered 'excalidraw-canvas' via ${agent.name} CLI`);
+            } catch (err) {
+              fail(`CLI registration failed: ${(err as Error).message}`);
+            }
+          }
+        }
+      }
+    } else {
+      info(`${DIM}MCP config unchanged.${RESET}`);
+    }
+
+    process.stdout.write(`\n  ${GREEN}${BOLD}Update complete!${RESET} Restart your MCP client to pick up changes.\n\n`);
+  } finally {
+    rl.close();
+  }
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 export async function runSetup(): Promise<void> {

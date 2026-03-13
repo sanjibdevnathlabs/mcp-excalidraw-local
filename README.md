@@ -41,6 +41,7 @@ Click the workspace badge to switch between isolated canvases — each workspace
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Verify Installation](#verify-installation)
+- [Updating](#updating)
 - [How We Differ from the Official Excalidraw MCP](#how-we-differ-from-the-official-excalidraw-mcp)
 - [What Changed From Upstream](#what-changed-from-upstream)
 - [Architecture](#architecture)
@@ -279,6 +280,119 @@ open http://localhost:3000
 ```
 
 If the health check fails, see [Troubleshooting](#troubleshooting).
+
+## Updating
+
+Already installed a previous version? The interactive update wizard is the easiest way to update everything — MCP server **and** agent skills — in one go.
+
+### Interactive Update (recommended)
+
+```bash
+npx @sanjibdevnath/mcp-excalidraw-local@latest update
+```
+
+<details>
+<summary>Example session</summary>
+
+```
+$ npx @sanjibdevnath/mcp-excalidraw-local@latest update
+
+  Excalidraw MCP — Update  v1.2.0
+
+  [1/2] Skill Update
+
+  Found 2 existing skill installation(s):
+    [1] Cursor (global) — ~/.cursor/skills/excalidraw-skill
+    [2] Claude Code (global) — ~/.claude/skills/excalidraw-skill
+
+  Update all 2 installation(s) to v1.2.0? [Y/n]: Y
+    ✔ Updated Cursor (global) — ~/.cursor/skills/excalidraw-skill
+    ✔ Updated Claude Code (global) — ~/.claude/skills/excalidraw-skill
+
+    2/2 skill(s) updated.
+
+  [2/2] MCP Configuration
+  Re-apply MCP server config? (overwrites existing entry) [y/N]: N
+    MCP config unchanged.
+
+  Update complete! Restart your MCP client to pick up changes.
+```
+</details>
+
+The update wizard:
+1. **Finds all existing skill installations** across Cursor, Claude Code, and Codex CLI (both global and local scopes)
+2. **Updates them in-place** with the latest skill files (SKILL.md, cheatsheet, geometric-thinking reference, helper scripts)
+3. **Offers to install** the skill for any detected agent that doesn't have it yet
+4. **Optionally re-applies MCP config** if needed
+
+> **Why this matters:** The agent skill contains workflow guidance, sizing rules, color palettes, and anti-patterns that evolve alongside the MCP tools. Updating the MCP server without updating the skill means your AI agent is working with stale instructions.
+
+### Manual Update by Installation Method
+
+If you prefer to update manually, follow the steps for your installation method, then restart your MCP client.
+
+#### npx users
+
+If your MCP config uses `npx -y @sanjibdevnath/mcp-excalidraw-local`, npx caches the package locally and won't automatically fetch new versions.
+
+**Option A — Clear the cache (one-time):**
+```bash
+npm cache clean --force
+```
+Then restart your MCP client. npx will download the latest version on next launch.
+
+**Option B — Pin to `@latest` in your MCP config (permanent fix):**
+
+Update the `args` in your MCP config to include `@latest`:
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "npx",
+      "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local@latest"],
+      "env": { "CANVAS_PORT": "3000" }
+    }
+  }
+}
+```
+
+This ensures npx always checks for the newest published version.
+
+#### From-source users
+
+```bash
+cd mcp-excalidraw-local
+git pull origin main
+npm install
+npm run build
+```
+
+#### Docker users
+
+```bash
+docker pull sanjibdevnath/mcp-excalidraw-local:latest
+docker pull sanjibdevnath/mcp-excalidraw-local-canvas:latest
+```
+
+Then recreate your containers (`docker compose up -d` or `docker run` again).
+
+#### Updating the agent skill manually
+
+If you skipped the interactive update, copy the skill files yourself:
+```bash
+cp -R skills/excalidraw-skill ~/.cursor/skills/excalidraw-skill
+cp -R skills/excalidraw-skill ~/.claude/skills/excalidraw-skill
+```
+
+### Verify the update
+
+```bash
+# Check the running version
+curl -s http://localhost:3000/health
+
+# Or check the installed package version
+npx @sanjibdevnath/mcp-excalidraw-local --version
+```
 
 ## How We Differ from the Official Excalidraw MCP
 

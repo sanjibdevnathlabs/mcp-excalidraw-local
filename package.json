@@ -19,6 +19,7 @@
     "production": "npm run build && npm run canvas",
     "prepublishOnly": "npm run build",
     "setup": "node dist/index.js setup",
+    "update": "node dist/index.js update",
     "type-check": "npx tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
