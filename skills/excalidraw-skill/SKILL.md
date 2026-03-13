@@ -125,6 +125,50 @@ Example (diamonds h=160, gap needed ≥ 120):
 
 If the gap is < 80px, arrows will be too short to see — especially with labels like "YES"/"NO".
 
+## Workflow: Multi-Diagram Canvas (Spatial Organization)
+
+Excalidraw's infinite canvas supports multiple diagrams coexisting side by side. **Never clear the canvas** to make room — place new diagrams spatially offset from existing ones.
+
+### Before Drawing Anything
+
+Always call `describe_scene` first. It reports:
+
+- **Diagram Zones**: grouped elements with bounding boxes, labels, and element counts
+- **Canvas bounding box**: the overall occupied area
+- **Suggested placement**: a recommended `(x, y)` for the next diagram (300px right of existing content)
+
+### Creating a New Diagram Alongside Existing Ones
+
+1. **`describe_scene`** — read the suggested placement coordinates
+2. **Offset your new diagram** to the suggested area (or 300px+ from the rightmost edge)
+3. **Add a title text element** above your diagram (fontSize 24-28) as an identifier
+4. **Create shapes** (Batch 1) with coordinates offset to the new area
+5. **Create arrows** (Batch 2)
+6. **`group_elements`** — group ALL elements of your new diagram together
+7. **`set_viewport`** with `scrollToContent: true` to see everything
+8. **Screenshot** to verify
+
+### Example Layout
+
+```
+  "Architecture" (group A)          "User Flow" (group B)
+  x=0 to x=1100                     x=1400 to x=2500
+  ┌─────────────────────┐           ┌─────────────────────┐
+  │                     │   300px   │                     │
+  │   Diagram A         │   gap    │   Diagram B         │
+  │                     │           │                     │
+  └─────────────────────┘           └─────────────────────┘
+```
+
+### Rules
+
+- **Never call `clear_canvas`** unless the user explicitly asks to wipe everything
+- **Always `describe_scene` before drawing** to see existing content
+- **Group every diagram** so `describe_scene` reports it as a named zone
+- **Add a title text element** as the first element of each diagram — this becomes the zone label
+- **Use `search_elements`** to find specific diagrams by their title text
+- **Use `set_viewport` with `scrollToElementId`** to navigate to a specific diagram
+
 ## Workflow: Draw A Diagram
 
 ### Phase 1: Plan
@@ -345,7 +389,7 @@ Use history to debug unexpected changes or audit what was modified.
 | Using `create_from_mermaid` for final diagrams | Overlapping text, poor layout | Use `batch_create_elements` with coordinates |
 | Shapes too small for text | Truncation, especially in diamonds | Use sizing formulas above |
 | No gap between connected shapes | Arrows become invisible (0px length) | Maintain 120px+ vertical gap |
-| Clearing canvas between diagrams | Loses previous work | Place diagrams side-by-side |
+| Clearing canvas between diagrams | Loses previous work, requires `confirm: true` | Place diagrams side-by-side using spatial offset; call `describe_scene` first |
 | Skipping screenshot verification | Invisible defects compound | Screenshot after EVERY batch |
 | Shapes + arrows in one batch | Binding errors | Shapes first, arrows second |
 | Default roughness (hand-drawn look) | Unprofessional for technical diagrams | Set `roughness: 0` on all elements |

@@ -44,6 +44,8 @@ function generateId(): string {
 }
 
 export function initDb(dbPath?: string): void {
+  if (db) return; // Already initialized
+
   const resolvedPath = dbPath
     || process.env.EXCALIDRAW_DB_PATH
     || path.join(os.homedir(), '.excalidraw-mcp', 'excalidraw.db');
@@ -127,6 +129,11 @@ function runMigrations(): void {
       elements    TEXT NOT NULL,
       created_at  TEXT NOT NULL DEFAULT (datetime('now')),
       UNIQUE(project_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_elements_project ON elements(project_id);
@@ -501,9 +508,21 @@ export function bulkReplaceElements(elements: ServerElement[], projectId?: strin
   return tx();
 }
 
+// ── Settings ──
+
+export function getSetting(key: string): string | undefined {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setSetting(key: string, value: string): void {
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
+}
+
 export function closeDb(): void {
   if (db) {
     db.close();
+    db = undefined as any;
     logger.info('SQLite database closed');
   }
 }

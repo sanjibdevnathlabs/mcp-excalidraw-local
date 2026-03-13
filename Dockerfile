@@ -33,12 +33,13 @@ RUN apt-get purge -y python3 make g++ && apt-get autoremove -y
 
 COPY --from=builder /app/dist ./dist
 
-RUN chown -R nodejs:nodejs /app
+RUN mkdir -p /app/data && chown -R nodejs:nodejs /app
 USER nodejs
 
 ENV NODE_ENV=production
 ENV EXPRESS_SERVER_URL=http://localhost:3000
 ENV ENABLE_CANVAS_SYNC=true
+ENV EXCALIDRAW_DB_PATH=/app/data/excalidraw.db
 
 CMD ["node", "dist/index.js"]
 

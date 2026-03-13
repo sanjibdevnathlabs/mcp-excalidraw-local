@@ -18,5 +18,10 @@ public/dist/
 # Development artifacts
 *.excalidraw
 
+# Test artifacts
+test-results/
+playwright-report/
+coverage/
+
 docs/*
 !docs/screenshots/
