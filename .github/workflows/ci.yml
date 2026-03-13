@@ -11,8 +11,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-changes:
+    name: Check for app changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_test: ${{ steps.filter.outputs.should_test }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check changed files
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "should_test=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only origin/main...HEAD || true)
+          if echo "$CHANGED" | grep -qE '^(src/|frontend/|tests/|package\.json|package-lock\.json|tsconfig\.json|vite\.config|vitest\.config|playwright\.config)'; then
+            echo "should_test=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No application code changed, skipping tests"
+            echo "should_test=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-test:
     name: Build & Test (Node ${{ matrix.node-version }})
+    needs: check-changes
+    if: needs.check-changes.outputs.should_test == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -55,6 +82,8 @@ jobs:
 
   lint-check:
     name: Lint Check
+    needs: check-changes
+    if: needs.check-changes.outputs.should_test == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,8 +102,9 @@ jobs:
 
   e2e:
     name: E2E Tests
+    needs: [check-changes, build-and-test]
+    if: needs.check-changes.outputs.should_test == 'true'
     runs-on: ubuntu-latest
-    needs: build-and-test
     steps:
       - uses: actions/checkout@v4
 
@@ -110,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     name: CI Status Check
-    needs: [build-and-test, lint-check, e2e]
+    needs: [check-changes, build-and-test, lint-check, e2e]
     if: always()
     permissions:
       statuses: write

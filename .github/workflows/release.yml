@@ -22,6 +22,7 @@ jobs:
       new_version: ${{ steps.bump.outputs.new_version }}
       changelog: ${{ steps.bump.outputs.changelog }}
       should_release: ${{ steps.bump.outputs.should_release }}
+      prev_tag: ${{ steps.bump.outputs.prev_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,23 +33,25 @@ jobs:
         run: |
           # Find the latest semver tag
           LATEST_TAG=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+          PREV_TAG="${LATEST_TAG:-}"
           if [ -z "$LATEST_TAG" ]; then
             LATEST_TAG=$(git rev-list --max-parents=0 HEAD)
             echo "No tags found, using first commit"
           fi
           echo "Latest tag: $LATEST_TAG"
 
-          # Get commit messages since last tag
-          COMMITS=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+          # Get commit messages since last tag (subject + body for BREAKING CHANGE footers)
+          SUBJECTS=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+          FULL_LOG=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%B---END---" 2>/dev/null || git log --pretty=format:"%B---END---")
 
-          if [ -z "$COMMITS" ]; then
+          if [ -z "$SUBJECTS" ]; then
             echo "No new commits since $LATEST_TAG"
             echo "should_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Skip if the only commit is a version bump
-          NON_RELEASE_COMMITS=$(echo "$COMMITS" | grep -v "^chore(release):" || true)
+          NON_RELEASE_COMMITS=$(echo "$SUBJECTS" | grep -v "^chore(release):" || true)
           if [ -z "$NON_RELEASE_COMMITS" ]; then
             echo "Only release commits found, skipping"
             echo "should_release=false" >> "$GITHUB_OUTPUT"
@@ -56,15 +59,17 @@ jobs:
           fi
 
           echo "Commits since $LATEST_TAG:"
-          echo "$COMMITS"
+          echo "$SUBJECTS"
 
-          # Determine bump type from conventional commit prefixes
+          # Determine bump type from conventional commit prefixes and footers
           BUMP="patch"
-          if echo "$COMMITS" | grep -qiE "^.*(BREAKING[ -]CHANGE|!)(\(.+\))?:"; then
+          if echo "$SUBJECTS" | grep -qiE "^.*(BREAKING[ -]CHANGE|!)(\(.+\))?:"; then
             BUMP="major"
-          elif echo "$COMMITS" | grep -qiE "^(feat|feature)(\(.+\))?:"; then
+          elif echo "$FULL_LOG" | grep -qiE "^BREAKING[ -]CHANGE:"; then
+            BUMP="major"
+          elif echo "$SUBJECTS" | grep -qiE "^(feat|feature)(\(.+\))?:"; then
             BUMP="minor"
-          elif echo "$COMMITS" | grep -qiE "^✨"; then
+          elif echo "$SUBJECTS" | grep -qiE "^✨"; then
             BUMP="minor"
           fi
 
@@ -81,35 +86,36 @@ jobs:
 
           # Build changelog from conventional commits
           CHANGELOG=""
-          BREAKING=$(echo "$COMMITS" | grep -iE "^.*(BREAKING[ -]CHANGE|!)(\(.+\))?:" || true)
-          FEATURES=$(echo "$COMMITS" | grep -iE "^(feat|feature|✨)" || true)
-          FIXES=$(echo "$COMMITS" | grep -iE "^(fix|🐛)" || true)
-          OTHERS=$(echo "$COMMITS" | grep -viE "^(feat|feature|✨|fix|🐛|chore\(release\))" | grep -viE "BREAKING" || true)
+          BREAKING=$(echo "$SUBJECTS" | grep -iE "^.*(BREAKING[ -]CHANGE|!)(\(.+\))?:" || true)
+          FEATURES=$(echo "$SUBJECTS" | grep -iE "^(feat|feature|✨)" || true)
+          FIXES=$(echo "$SUBJECTS" | grep -iE "^(fix|🐛)" || true)
+          OTHERS=$(echo "$SUBJECTS" | grep -viE "^(feat|feature|✨|fix|🐛|chore\(release\))" | grep -viE "BREAKING" || true)
 
           if [ -n "$BREAKING" ]; then
-            CHANGELOG="$CHANGELOG
-          ### ⚠️ Breaking Changes
-          $(echo "$BREAKING" | sed 's/^/- /')"
+            CHANGELOG="${CHANGELOG}
+### ⚠️ Breaking Changes
+$(echo "$BREAKING" | sed 's/^/- /')"
           fi
           if [ -n "$FEATURES" ]; then
-            CHANGELOG="$CHANGELOG
-          ### ✨ Features
-          $(echo "$FEATURES" | sed 's/^/- /')"
+            CHANGELOG="${CHANGELOG}
+### ✨ Features
+$(echo "$FEATURES" | sed 's/^/- /')"
           fi
           if [ -n "$FIXES" ]; then
-            CHANGELOG="$CHANGELOG
-          ### 🐛 Bug Fixes
-          $(echo "$FIXES" | sed 's/^/- /')"
+            CHANGELOG="${CHANGELOG}
+### 🐛 Bug Fixes
+$(echo "$FIXES" | sed 's/^/- /')"
           fi
           if [ -n "$OTHERS" ]; then
-            CHANGELOG="$CHANGELOG
-          ### 📦 Other Changes
-          $(echo "$OTHERS" | sed 's/^/- /')"
+            CHANGELOG="${CHANGELOG}
+### 📦 Other Changes
+$(echo "$OTHERS" | sed 's/^/- /')"
           fi
 
           echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
 
           # Multi-line output for changelog
           {
@@ -152,14 +158,22 @@ jobs:
     outputs:
       version: ${{ needs.check.outputs.new_version }}
     steps:
+      - name: Generate release bot token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "sanjibdevnathlabs-release-bot[bot]"
+          git config user.email "${{ secrets.APP_ID }}+sanjibdevnathlabs-release-bot[bot]@users.noreply.github.com"
 
       - name: Bump version in package.json
         run: |
@@ -176,13 +190,15 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ steps.app-token.outputs.token }}
           tag_name: v${{ needs.check.outputs.new_version }}
           name: v${{ needs.check.outputs.new_version }}
+          generate_release_notes: true
           body: |
             ## What's Changed in v${{ needs.check.outputs.new_version }}
             ${{ needs.check.outputs.changelog }}
 
-            **Full Changelog**: https://github.com/${{ github.repository }}/compare/v${{ needs.check.outputs.new_version }}...v${{ needs.check.outputs.new_version }}
+            **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ needs.check.outputs.prev_tag && needs.check.outputs.prev_tag || 'initial' }}...v${{ needs.check.outputs.new_version }}
 
             ---
             ```
