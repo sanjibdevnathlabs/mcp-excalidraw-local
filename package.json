@@ -18,7 +18,6 @@
     "dev:server": "npx tsc --watch",
     "production": "npm run build && npm run canvas",
     "prepublishOnly": "npm run build",
-    "postinstall": "prebuild-install --runtime napi || node-gyp rebuild --directory node_modules/better-sqlite3",
     "setup": "node dist/index.js setup",
     "type-check": "npx tsc --noEmit",
     "test": "vitest run",
