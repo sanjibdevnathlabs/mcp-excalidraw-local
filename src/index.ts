@@ -25,7 +25,9 @@ import {
   EXCALIDRAW_ELEMENT_TYPES,
   ServerElement,
   ExcalidrawElementType,
-  validateElement
+  validateElement,
+  normalizeFontFamily,
+  files as globalFiles
 } from './types.js';
 import fetch from 'node-fetch';
 import { startCanvasServer, stopCanvasServer } from './server.js';
@@ -62,6 +64,10 @@ function sanitizeFilePath(filePath: string): string {
 const CANVAS_PORT = process.env.CANVAS_PORT || process.env.PORT || '3000';
 const EXPRESS_SERVER_URL = process.env.EXPRESS_SERVER_URL || `http://localhost:${CANVAS_PORT}`;
 const ENABLE_CANVAS_SYNC = true;
+
+// One-time tokens for clear_canvas confirmation (token → expiry timestamp)
+const pendingClearTokens = new Map<string, { expiresAt: number; elementCount: number }>();
+const CLEAR_TOKEN_TTL_MS = 120_000; // 2 minutes
 
 // API Response types
 interface ApiResponse {
@@ -247,7 +253,7 @@ const ElementSchema = z.object({
   opacity: z.number().optional(),
   text: z.string().optional(),
   fontSize: z.number().optional(),
-  fontFamily: z.string().optional(),
+  fontFamily: z.union([z.string(), z.number()]).optional(),
   groupIds: z.array(z.string()).optional(),
   locked: z.boolean().optional(),
   strokeStyle: z.string().optional(),
@@ -258,6 +264,9 @@ const ElementSchema = z.object({
   endElementId: z.string().optional(),
   endArrowhead: z.string().optional(),
   startArrowhead: z.string().optional(),
+  fileId: z.string().optional(),
+  status: z.string().optional(),
+  scale: z.tuple([z.number(), z.number()]).optional(),
 });
 
 const ElementIdSchema = z.object({
@@ -409,7 +418,7 @@ const tools: Tool[] = [
         opacity: { type: 'number' },
         text: { type: 'string' },
         fontSize: { type: 'number' },
-        fontFamily: { type: 'string' },
+        fontFamily: { type: ['string', 'number'], description: 'Font family: 1=Excalifont (hand-drawn), 2=Helvetica (sans-serif), 3=Cascadia (monospace), 4=Comic Shanns, 5=Liberation Sans, 6=Nunito, 7=Lilita One. Accepts name strings too.' },
         startElementId: { type: 'string', description: 'For arrows: ID of the element to bind the arrow start to. Arrow auto-routes to element edge.' },
         endElementId: { type: 'string', description: 'For arrows: ID of the element to bind the arrow end to. Arrow auto-routes to element edge.' },
         endArrowhead: { type: 'string', description: 'Arrowhead style at end: arrow, bar, dot, triangle, or null' },
@@ -640,7 +649,7 @@ const tools: Tool[] = [
               opacity: { type: 'number' },
               text: { type: 'string' },
               fontSize: { type: 'number' },
-              fontFamily: { type: 'string' },
+              fontFamily: { type: ['string', 'number'], description: 'Font family: 1=Excalifont, 2=Helvetica, 3=Cascadia, 4=Comic Shanns, 5=Liberation Sans, 6=Nunito, 7=Lilita One. Accepts name strings too.' },
               startElementId: { type: 'string', description: 'For arrows: ID of element to bind arrow start to' },
               endElementId: { type: 'string', description: 'For arrows: ID of element to bind arrow end to' },
               endArrowhead: { type: 'string', description: 'Arrowhead style at end: arrow, bar, dot, triangle, or null' },
@@ -666,10 +675,15 @@ const tools: Tool[] = [
   },
   {
     name: 'clear_canvas',
-    description: 'Clear all elements from the canvas',
+    description: 'DESTRUCTIVE: Permanently deletes ALL elements from the canvas. Two-step process: (1) Call WITHOUT clearToken to get a preview of what will be deleted — present this to the user and ask for confirmation. (2) Call WITH the returned clearToken to execute the clear. Prefer placing new diagrams alongside existing ones (call describe_scene first).',
     inputSchema: {
       type: 'object',
-      properties: {}
+      properties: {
+        clearToken: {
+          type: 'string',
+          description: 'One-time token returned by the preview step. Pass this to confirm and execute the clear. Omit on first call to get the preview.'
+        }
+      }
     }
   },
   {
@@ -973,11 +987,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         const { startElementId, endElementId, id: customId, ...elementProps } = params;
         const id = customId || generateId();
+        const normalizedFont = normalizeFontFamily(elementProps.fontFamily);
         const element: ServerElement = {
           id,
           ...elementProps,
+          ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
           points: elementProps.points ? normalizePoints(elementProps.points) : undefined,
-          // Convert binding IDs to Excalidraw's start/end format
           ...(startElementId ? { start: { id: startElementId } } : {}),
           ...(endElementId ? { end: { id: endElementId } } : {}),
           createdAt: new Date().toISOString(),
@@ -1020,10 +1035,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         if (!id) throw new Error('Element ID is required');
 
-        // Build update payload with timestamp and version increment
+        const normalizedFont = normalizeFontFamily(updates.fontFamily);
         const updatePayload: Partial<ServerElement> & { id: string } = {
           id,
           ...updates,
+          ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
           points: rawPoints ? normalizePoints(rawPoints) : undefined,
           updatedAt: new Date().toISOString()
         };
@@ -1468,11 +1484,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         for (const elementData of params.elements) {
           const { startElementId, endElementId, id: customId, ...elementProps } = elementData;
           const id = customId || generateId();
+          const normalizedFont = normalizeFontFamily(elementProps.fontFamily);
           const element: ServerElement = {
             id,
             ...elementProps,
+            ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
             points: elementProps.points ? normalizePoints(elementProps.points) : undefined,
-            // Convert binding IDs to Excalidraw's start/end format
             ...(startElementId ? { start: { id: startElementId } } : {}),
             ...(endElementId ? { end: { id: endElementId } } : {}),
             createdAt: new Date().toISOString(),
@@ -1530,23 +1547,99 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'clear_canvas': {
-        logger.info('Clearing canvas via MCP');
+        const clearParams = z.object({ clearToken: z.string().optional() }).parse(args);
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, {
+        if (!clearParams.clearToken) {
+          // Step 1: Preview — show what will be deleted and return a one-time token
+          const previewResp = await fetch(`${EXPRESS_SERVER_URL}/api/elements`, {
+            headers: canvasHeaders()
+          });
+          if (!previewResp.ok) throw new Error('Failed to fetch elements for preview');
+          const previewData = await previewResp.json() as ApiResponse;
+          const elements = previewData.elements || [];
+          const count = elements.length;
+
+          if (count === 0) {
+            return {
+              content: [{ type: 'text', text: 'The canvas is already empty. Nothing to clear.' }]
+            };
+          }
+
+          // Build a summary of what exists
+          const typeCounts: Record<string, number> = {};
+          for (const el of elements) {
+            typeCounts[el.type] = (typeCounts[el.type] || 0) + 1;
+          }
+          const typesSummary = Object.entries(typeCounts).map(([t, c]) => `${t}(${c})`).join(', ');
+
+          // Generate one-time token
+          const token = `clr_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+          pendingClearTokens.set(token, { expiresAt: Date.now() + CLEAR_TOKEN_TTL_MS, elementCount: count });
+
+          // Prune expired tokens
+          for (const [k, v] of pendingClearTokens) {
+            if (v.expiresAt < Date.now()) pendingClearTokens.delete(k);
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: [
+                `⚠️  CLEAR CANVAS — confirmation required`,
+                ``,
+                `This will permanently delete **${count} element${count !== 1 ? 's' : ''}**: ${typesSummary}`,
+                ``,
+                `Ask the user: "Do you want me to clear all ${count} elements from the canvas?"`,
+                ``,
+                `If the user confirms, call clear_canvas again with clearToken: "${token}"`,
+                `If the user declines, do NOT call clear_canvas again.`,
+              ].join('\n')
+            }]
+          };
+        }
+
+        // Step 2: Execute clear with a valid token
+        const tokenData = pendingClearTokens.get(clearParams.clearToken);
+        if (!tokenData) {
+          return {
+            content: [{
+              type: 'text',
+              text: 'Clear canvas rejected: invalid or expired clearToken. Call clear_canvas without clearToken first to get a fresh preview and token.'
+            }],
+            isError: true
+          };
+        }
+        if (tokenData.expiresAt < Date.now()) {
+          pendingClearTokens.delete(clearParams.clearToken);
+          return {
+            content: [{
+              type: 'text',
+              text: 'Clear canvas rejected: clearToken has expired. Call clear_canvas without clearToken to get a new one.'
+            }],
+            isError: true
+          };
+        }
+
+        // Token valid — consume it and clear
+        pendingClearTokens.delete(clearParams.clearToken);
+
+        logger.info('Clearing canvas via MCP (user confirmed via token)');
+
+        const clearResponse = await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, {
           method: 'DELETE',
           headers: canvasHeaders()
         });
 
-        if (!response.ok) {
-          throw new Error(`Failed to clear canvas: ${response.status} ${response.statusText}`);
+        if (!clearResponse.ok) {
+          throw new Error(`Failed to clear canvas: ${clearResponse.status} ${clearResponse.statusText}`);
         }
 
-        const data = await response.json() as ApiResponse;
+        const clearData = await clearResponse.json() as ApiResponse;
 
         return {
           content: [{
             type: 'text',
-            text: `Canvas cleared.\n\n${JSON.stringify(data, null, 2)}`
+            text: `Canvas cleared.\n\n${JSON.stringify(clearData, null, 2)}`
           }]
         };
       }
@@ -1568,6 +1661,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const data = await response.json() as ApiResponse;
         const sceneElements = data.elements || [];
 
+        // Collect files from the in-memory store
+        const exportFiles: Record<string, any> = {};
+        for (const [id, file] of globalFiles) {
+          exportFiles[id] = file;
+        }
+
         const excalidrawScene = {
           type: 'excalidraw',
           version: 2,
@@ -1576,7 +1675,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           appState: {
             viewBackgroundColor: '#ffffff',
             gridSize: null
-          }
+          },
+          files: exportFiles
         };
 
         const jsonString = JSON.stringify(excalidrawScene, null, 2);
@@ -1587,7 +1687,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           return {
             content: [{
               type: 'text',
-              text: `Scene exported to ${safePath} (${sceneElements.length} elements)`
+              text: `Scene exported to ${safePath} (${sceneElements.length} elements, ${Object.keys(exportFiles).length} files)`
             }]
           };
         }
@@ -1627,6 +1727,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         if (importElements.length === 0) {
           throw new Error('No elements found in the import data');
+        }
+
+        // Import files if present
+        const importedFiles = sceneData.files;
+        if (importedFiles && typeof importedFiles === 'object') {
+          for (const [id, fileData] of Object.entries(importedFiles)) {
+            const file = fileData as any;
+            globalFiles.set(id, {
+              id,
+              mimeType: file.mimeType || 'image/png',
+              dataURL: file.dataURL,
+              created: file.created || Date.now(),
+            });
+          }
+          // Push files to canvas server
+          try {
+            await fetch(`${EXPRESS_SERVER_URL}/api/files`, {
+              method: 'POST',
+              headers: canvasHeaders(),
+              body: JSON.stringify({ files: importedFiles })
+            });
+          } catch {}
         }
 
         if (params.mode === 'replace') {
@@ -1814,7 +1936,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         if (allElements.length === 0) {
           return {
-            content: [{ type: 'text', text: 'The canvas is empty. No elements to describe.' }]
+            content: [{ type: 'text', text: 'The canvas is empty. No elements to describe.\n\nSuggested placement for a new diagram: x=0, y=0' }]
           };
         }
 
@@ -1824,7 +1946,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           typeCounts[el.type] = (typeCounts[el.type] || 0) + 1;
         }
 
-        // Bounding box
+        // Overall bounding box
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         for (const el of allElements) {
           minX = Math.min(minX, el.x);
@@ -1832,6 +1954,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           maxX = Math.max(maxX, el.x + (el.width || 0));
           maxY = Math.max(maxY, el.y + (el.height || 0));
         }
+
+        // ── Diagram zone detection ──
+        // Build a map of groupId → elements
+        const groupMap: Record<string, ServerElement[]> = {};
+        const ungroupedElements: ServerElement[] = [];
+        for (const el of allElements) {
+          if (el.groupIds && el.groupIds.length > 0) {
+            for (const gid of el.groupIds) {
+              if (!groupMap[gid]) groupMap[gid] = [];
+              groupMap[gid]!.push(el);
+            }
+          } else {
+            ungroupedElements.push(el);
+          }
+        }
+
+        interface DiagramZone {
+          groupId: string;
+          label: string | null;
+          bbox: { minX: number; minY: number; maxX: number; maxY: number };
+          elementCount: number;
+        }
+
+        const zones: DiagramZone[] = [];
+        for (const [gid, elements] of Object.entries(groupMap)) {
+          let zMinX = Infinity, zMinY = Infinity, zMaxX = -Infinity, zMaxY = -Infinity;
+          let label: string | null = null;
+
+          for (const el of elements) {
+            zMinX = Math.min(zMinX, el.x);
+            zMinY = Math.min(zMinY, el.y);
+            zMaxX = Math.max(zMaxX, el.x + (el.width || 0));
+            zMaxY = Math.max(zMaxY, el.y + (el.height || 0));
+
+            // Use the first text element or label as the zone name
+            if (!label) {
+              if (el.type === 'text' && el.text) label = el.text;
+              else if (el.label?.text) label = el.label.text;
+            }
+          }
+
+          zones.push({
+            groupId: gid,
+            label,
+            bbox: { minX: zMinX, minY: zMinY, maxX: zMaxX, maxY: zMaxY },
+            elementCount: elements.length,
+          });
+        }
+
+        // Suggest next placement: 300px to the right of the overall bounding box
+        const suggestedX = Math.round(maxX + 300);
+        const suggestedY = Math.round(minY);
 
         // Build element descriptions sorted top-to-bottom, left-to-right
         const sorted = [...allElements].sort((a, b) => {
@@ -1879,7 +2053,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         lines.push(`## Canvas Description`);
         lines.push(`Total elements: ${allElements.length}`);
         lines.push(`Types: ${Object.entries(typeCounts).map(([t, c]) => `${t}(${c})`).join(', ')}`);
-        lines.push(`Bounding box: (${Math.round(minX)}, ${Math.round(minY)}) to (${Math.round(maxX)}, ${Math.round(maxY)}) = ${Math.round(maxX - minX)}x${Math.round(maxY - minY)}`);
+        lines.push(`Canvas bounding box: (${Math.round(minX)}, ${Math.round(minY)}) to (${Math.round(maxX)}, ${Math.round(maxY)}) = ${Math.round(maxX - minX)}x${Math.round(maxY - minY)}`);
+
+        // Diagram zones section
+        if (zones.length > 0) {
+          lines.push('');
+          lines.push('### Diagram Zones (grouped):');
+          for (const zone of zones) {
+            const w = Math.round(zone.bbox.maxX - zone.bbox.minX);
+            const h = Math.round(zone.bbox.maxY - zone.bbox.minY);
+            const name = zone.label ? `"${zone.label}"` : '(unnamed)';
+            lines.push(`  Group ${zone.groupId}: ${name} | bbox (${Math.round(zone.bbox.minX)}, ${Math.round(zone.bbox.minY)}) to (${Math.round(zone.bbox.maxX)}, ${Math.round(zone.bbox.maxY)}) = ${w}x${h} | ${zone.elementCount} elements`);
+          }
+        }
+
+        if (ungroupedElements.length > 0 && zones.length > 0) {
+          lines.push(`  + ${ungroupedElements.length} ungrouped elements`);
+        }
+
+        lines.push('');
+        lines.push(`### Suggested placement for new diagram: x=${suggestedX}, y=${suggestedY}`);
+
         lines.push('');
         lines.push('### Elements (top-to-bottom, left-to-right):');
         lines.push(...elementDescs);
@@ -1888,23 +2082,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           lines.push('');
           lines.push('### Connections:');
           lines.push(...connectionDescs);
-        }
-
-        // Groups
-        const groupedElements = allElements.filter(el => el.groupIds && el.groupIds.length > 0);
-        if (groupedElements.length > 0) {
-          const groupMap: Record<string, string[]> = {};
-          for (const el of groupedElements) {
-            for (const gid of (el.groupIds || [])) {
-              if (!groupMap[gid]) groupMap[gid] = [];
-              groupMap[gid]!.push(el.id);
-            }
-          }
-          lines.push('');
-          lines.push('### Groups:');
-          for (const [gid, ids] of Object.entries(groupMap)) {
-            lines.push(`  Group ${gid}: [${ids.join(', ')}]`);
-          }
         }
 
         return {
@@ -2533,10 +2710,17 @@ if (process.env.DEBUG === 'true') {
 
 // Start the server if this file is run directly
 if (fileURLToPath(import.meta.url) === process.argv[1]) {
-  runServer().catch(error => {
-    logger.error('Failed to start server:', error);
-    process.exit(1);
-  });
+  if (process.argv[2] === 'setup') {
+    import('./setup.js').then(m => m.runSetup()).catch(error => {
+      process.stderr.write(`Setup failed: ${(error as Error).message}\n`);
+      process.exit(1);
+    });
+  } else {
+    runServer().catch(error => {
+      logger.error('Failed to start server:', error);
+      process.exit(1);
+    });
+  }
 }
 
 export default runServer;

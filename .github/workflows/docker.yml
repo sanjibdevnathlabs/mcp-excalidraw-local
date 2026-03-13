@@ -1,144 +1,134 @@
-name: Docker Build & Push
+name: Docker Build
 
+# PR validation and manual builds. Production pushes are handled by release.yml.
 on:
-  push:
-    branches: [ main ]
-    tags:
-      - 'v*.*.*'
   pull_request:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - 'Dockerfile*'
+      - 'src/**'
+      - 'frontend/**'
+      - 'package.json'
   workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push images to Docker Hub'
+        required: true
+        type: boolean
+        default: false
 
 env:
-  REGISTRY: docker.io
   IMAGE_NAME_MCP: sanjibdevnath/mcp-excalidraw-local
   IMAGE_NAME_CANVAS: sanjibdevnath/mcp-excalidraw-local-canvas
 
 jobs:
-  build-and-push-mcp:
-    name: Build and Push MCP Server Image
+  build-mcp:
+    name: Build MCP Server image
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.push == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata for MCP Server
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_MCP }}
+          images: ${{ env.IMAGE_NAME_MCP }}
           tags: |
-            type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push MCP Server image
+      - name: Build MCP Server image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
 
-  build-and-push-canvas:
-    name: Build and Push Canvas Server Image
+  build-canvas:
+    name: Build Canvas Server image
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.push == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata for Canvas Server
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CANVAS }}
+          images: ${{ env.IMAGE_NAME_CANVAS }}
           tags: |
-            type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Canvas Server image
+      - name: Build Canvas Server image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.canvas
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
 
-  test-docker-images:
-    name: Test Docker Images
-    needs: [build-and-push-mcp, build-and-push-canvas]
-    if: github.event_name != 'pull_request'
+  test-images:
+    name: Test Docker images
+    needs: [build-mcp, build-canvas]
     runs-on: ubuntu-latest
-
     steps:
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: actions/checkout@v4
 
-      - name: Test Canvas Server image
+      - name: Build and test Canvas image locally
         run: |
-          docker pull ${{ env.IMAGE_NAME_CANVAS }}:latest
-          docker run -d -p 3000:3000 --name test-canvas ${{ env.IMAGE_NAME_CANVAS }}:latest
-          sleep 10
-          curl -f http://localhost:3000/health || exit 1
-          docker logs test-canvas
+          docker build -f Dockerfile.canvas -t canvas-test .
+          docker run -d -p 3000:3000 --name test-canvas canvas-test
+          HEALTHY=false
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+              echo "Health check passed on attempt $i"
+              HEALTHY=true
+              break
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 1
+          done
+          if [ "$HEALTHY" != "true" ]; then
+            echo "::error::Health check failed after 30 attempts"
+            docker logs test-canvas
+            docker stop test-canvas || true
+            exit 1
+          fi
+          curl -sf http://localhost:3000/health | jq .
           docker stop test-canvas
-
-      - name: Test MCP Server image
-        run: |
-          docker pull ${{ env.IMAGE_NAME_MCP }}:latest
-          echo "MCP Server image pulled successfully"
 
   docker-status:
     runs-on: ubuntu-latest
     continue-on-error: false
     name: Docker Build Status Check
-    needs: [build-and-push-mcp, build-and-push-canvas]
+    needs: [build-mcp, build-canvas, test-images]
     if: always()
     permissions:
       statuses: write

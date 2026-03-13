@@ -37,14 +37,13 @@ Click the workspace badge to switch between isolated canvases — each workspace
 ## Table of Contents
 
 - [Screenshots](#screenshots)
-- [What It Is](#what-it-is)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Verify Installation](#verify-installation)
 - [How We Differ from the Official Excalidraw MCP](#how-we-differ-from-the-official-excalidraw-mcp)
 - [What Changed From Upstream](#what-changed-from-upstream)
-- [What's New](#whats-new)
 - [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Quick Start (Docker)](#quick-start-docker)
-- [Configuration](#configuration)
 - [Environment Variables](#environment-variables)
 - [Multi-Tenancy (Workspaces)](#multi-tenancy-workspaces)
 - [Agent Skill (Optional)](#agent-skill-optional)
@@ -55,15 +54,233 @@ Click the workspace badge to switch between isolated canvases — each workspace
 - [Development](#development)
 - [Credits](#credits)
 
-## What It Is
+## Prerequisites
 
-This MCP server gives AI agents a full canvas toolkit to build, inspect, and iteratively refine Excalidraw diagrams — including the ability to see what they drew.
+| Requirement | Why | Check |
+|---|---|---|
+| **Node.js >= 18** (LTS 20 or 22 recommended) | Runtime | `node --version` |
+| **C++ build tools** | `better-sqlite3` compiles native bindings | See below |
+| **npm** (bundled with Node.js) | Package manager | `npm --version` |
 
-The repo contains a single Node.js process that runs:
+### C++ build tools by platform
 
-- **MCP server** (stdio): 32 tools for element CRUD, layout, scene awareness, file I/O, snapshots, search, multi-tenancy, and more
-- **Canvas server** (embedded): web UI + REST API + WebSocket updates at `http://localhost:<CANVAS_PORT>`
-- **SQLite database**: persistent storage at `~/.excalidraw-mcp/excalidraw.db`
+**macOS:**
+```bash
+xcode-select --install
+```
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install build-essential python3
+```
+
+**Windows:**
+```bash
+npm install --global windows-build-tools
+```
+
+> `better-sqlite3` ships prebuilt binaries for most Node LTS versions. The build tools are only needed when a prebuilt binary isn't available for your platform/Node combination.
+
+## Quick Start
+
+### Path A: Interactive Setup (recommended for first-time users)
+
+The setup wizard checks your environment, optionally installs the agent skill, and configures MCP clients — all interactively. Every step is skippable.
+
+```bash
+npx @sanjibdevnath/mcp-excalidraw-local setup
+```
+
+<details>
+<summary>Example session</summary>
+
+```
+$ npx @sanjibdevnath/mcp-excalidraw-local setup
+
+  Excalidraw MCP — Setup
+
+  [1/3] Environment
+    ✔ Node.js v22.12.0 .................. OK
+    ✔ better-sqlite3 bindings ........... OK
+    ✔ Frontend build .................... OK
+
+  [2/3] Agent Skill
+  Install the Excalidraw agent skill? [Y/n]: Y
+
+  Detected agents:
+    [1] Cursor       (~/.cursor)
+    [2] Claude Code  (~/.claude)
+
+  Which agents? (comma-separated, 'all', or 'skip'): all
+
+  Cursor — scope? [G]lobal / [l]ocal: G
+    ✔ Installed to ~/.cursor/skills/excalidraw-skill/
+
+  Claude Code — scope? [G]lobal / [l]ocal: G
+    ✔ Installed to ~/.claude/skills/excalidraw-skill/
+
+  [3/3] MCP Configuration
+  Add MCP server to agent configs automatically? [Y/n]: Y
+
+  Cursor — add to ~/.cursor/mcp.json? [Y/n]: Y
+    ✔ Added 'excalidraw-canvas' to ~/.cursor/mcp.json
+
+  Claude Code — register via CLI? [Y/n]: Y
+    ✔ Registered 'excalidraw-canvas' via Claude Code CLI
+
+  Done! Open http://localhost:3000 to verify the canvas.
+```
+</details>
+
+> **The setup is fully optional.** If you prefer to configure everything manually, skip to Path B or C below.
+
+### Path B: From Source
+
+```bash
+git clone https://github.com/sanjibdevnathlabs/mcp-excalidraw-local.git
+cd mcp-excalidraw-local
+
+npm install
+npm run build
+```
+
+Then configure your MCP client — see [Configuration](#configuration).
+
+To run manually (outside an MCP client):
+```bash
+node dist/index.js
+```
+
+Open `http://localhost:3000` in your browser.
+
+### Path C: Docker
+
+Canvas server:
+```bash
+docker run -d -p 3000:3000 --name mcp-excalidraw-canvas sanjibdevnath/mcp-excalidraw-local-canvas:latest
+```
+
+MCP server (stdio) is typically launched by your MCP client:
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "CANVAS_PORT=3000",
+        "sanjibdevnath/mcp-excalidraw-local:latest"
+      ]
+    }
+  }
+}
+```
+
+> **Note:** For Docker on Linux, add `--add-host=host.docker.internal:host-gateway`.
+
+## Configuration
+
+This is a standard MCP server communicating over **stdio**. It works with any MCP-compatible client.
+
+### Cursor
+
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
+
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "npx",
+      "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local"],
+      "env": {
+        "CANVAS_PORT": "3000"
+      }
+    }
+  }
+}
+```
+
+Or, if installed from source:
+
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp-excalidraw-local/dist/index.js"],
+      "env": {
+        "CANVAS_PORT": "3000"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "npx",
+      "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local"],
+      "env": {
+        "CANVAS_PORT": "3000"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+```bash
+claude mcp add excalidraw-canvas --scope user \
+  -e CANVAS_PORT=3000 \
+  -- npx -y @sanjibdevnath/mcp-excalidraw-local
+```
+
+### Codex CLI
+
+Add to `~/.codex/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "npx",
+      "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local"],
+      "env": {
+        "CANVAS_PORT": "3000"
+      }
+    }
+  }
+}
+```
+
+### Key points
+
+- **Single process** — The canvas server is embedded. No separate terminal or process needed.
+- **Browser required for screenshots** — `export_to_image` and `get_canvas_screenshot` rely on the frontend. Open `http://localhost:3000` in a browser.
+
+## Verify Installation
+
+After configuring your MCP client, verify everything works:
+
+```bash
+# 1. Check the canvas server is running
+curl http://localhost:3000/health
+
+# 2. Open the canvas in your browser
+open http://localhost:3000
+
+# 3. In your AI agent, ask it to:
+#    "Create a blue rectangle labeled 'Hello World' on the Excalidraw canvas"
+```
+
+If the health check fails, see [Troubleshooting](#troubleshooting).
 
 ## How We Differ from the Official Excalidraw MCP
 
@@ -89,8 +306,6 @@ Excalidraw now has an [official MCP](https://github.com/excalidraw/excalidraw-mc
 | **Multi-agent** | Single user | Multiple agents can draw on the same canvas concurrently |
 | **Works without MCP** | No | Yes — REST API fallback via agent skill |
 
-**TL;DR** — The official MCP generates diagrams. We give AI agents a full canvas toolkit to build, inspect, and iteratively refine diagrams — including the ability to see what they drew.
-
 ## What Changed From Upstream
 
 This fork extends [yctimlin/mcp_excalidraw](https://github.com/yctimlin/mcp_excalidraw) with the following enhancements:
@@ -105,51 +320,6 @@ This fork extends [yctimlin/mcp_excalidraw](https://github.com/yctimlin/mcp_exca
 | **MCP tools** | 26 | 32 (added search, history, tenants, projects) |
 | **Workspace switcher** | None | Dropdown with search in canvas UI |
 | **Sync normalization** | Bound text breaks on reload | Elements normalized to MCP format before storage |
-| **Projects** | None | Multiple projects per tenant |
-| **Element history** | None | Full version history per element |
-| **Search** | None | Full-text search across elements |
-
-### New MCP Tools (6 added)
-
-| Tool | Description |
-|---|---|
-| `search_elements` | Full-text search across element labels and text |
-| `element_history` | View version history for any element |
-| `list_projects` | List projects within the active tenant |
-| `switch_project` | Switch between projects |
-| `list_tenants` | List all workspace tenants |
-| `switch_tenant` | Switch the active workspace tenant |
-
-## What's New
-
-### v1.0 — This Fork (Persistence & Multi-Tenancy)
-
-- **SQLite persistence**: Elements, projects, tenants, snapshots, and element versions stored in `~/.excalidraw-mcp/excalidraw.db` with WAL mode and `busy_timeout` for multi-process safety
-- **Multi-tenancy**: Each workspace gets an isolated canvas. Tenant auto-detected from workspace path via `server.listRoots()`. UI dropdown with search for switching workspaces
-- **Embedded canvas**: Canvas server runs inside the MCP process — single `node dist/index.js` starts everything, stops together
-- **Auto-sync with debounce**: Canvas changes are automatically persisted after 3s of inactivity. Manual sync button as fallback. Toggle auto-sync on/off
-- **Configurable port**: `CANVAS_PORT` env var (default `3000`)
-- **Sync normalization**: Excalidraw's internal bound-text representation is normalized to MCP format before storage, preventing text overflow/detachment on reload
-- **6 new MCP tools**: `search_elements`, `element_history`, `list_projects`, `switch_project`, `list_tenants`, `switch_tenant`
-- **Updated agent skill**: Comprehensive workflow playbook with iterative write-check-review cycle, sizing rules, anti-patterns, and quality checklist
-- **Workspace switcher UI**: Click "Workspace: ..." badge to search and switch between workspaces
-
-### v2.0 — Canvas Toolkit (upstream)
-
-- 13 new MCP tools (26 total): `get_element`, `clear_canvas`, `export_scene`, `import_scene`, `export_to_image`, `duplicate_elements`, `snapshot_scene`, `restore_snapshot`, `describe_scene`, `get_canvas_screenshot`, `read_diagram_guide`, `export_to_excalidraw_url`, `set_viewport`
-- **Closed feedback loop**: AI can now inspect the canvas (`describe_scene`) and see it (`get_canvas_screenshot` returns an image) — enabling iterative refinement
-- **Design guide**: `read_diagram_guide` returns best-practice color palettes, sizing rules, layout patterns, and anti-patterns
-- **Viewport control**: `set_viewport` with `scrollToContent`, `scrollToElementId`, or manual zoom/offset
-- **File I/O**: export/import full `.excalidraw` JSON files
-- **Snapshots**: save and restore named canvas states
-- **Skill fallback**: Agent skill auto-detects MCP vs REST API mode
-- Fixed all previously known issues: `align_elements` / `distribute_elements` fully implemented, points type normalization, removed invalid `label` type, `ungroup_elements` now errors on failure
-
-### v1.x (upstream)
-
-- Agent skill: `skills/excalidraw-skill/` (portable instructions + helper scripts for export/import and repeatable CRUD)
-- Better testing loop: MCP Inspector CLI examples + browser screenshot checks
-- Bugfixes: batch create now preserves element ids (fixes update/delete after batch); frontend entrypoint fixed
 
 ## Architecture
 
@@ -159,111 +329,6 @@ This fork extends [yctimlin/mcp_excalidraw](https://github.com/yctimlin/mcp_exca
 - **SQLite**: Stored at `~/.excalidraw-mcp/excalidraw.db` by default. WAL mode + `busy_timeout` for multi-process safety.
 - **Multi-tenancy**: Each workspace gets an isolated tenant (SHA-256 hash of workspace path). The UI shows a workspace switcher dropdown with search.
 
-## Quick Start
-
-### Option A: NPM (recommended)
-
-```bash
-npx @sanjibdevnath/mcp-excalidraw-local
-```
-
-Or install globally:
-
-```bash
-npm install -g @sanjibdevnath/mcp-excalidraw-local
-mcp-excalidraw-local
-```
-
-### Option B: From source
-
-**Prerequisites:** Node >= 18, npm or pnpm
-
-```bash
-git clone https://github.com/sanjibdevnathlabs/mcp-excalidraw-local.git
-cd mcp-excalidraw-local
-
-# Install dependencies (pnpm or npm)
-pnpm install
-pnpm rebuild better-sqlite3 esbuild
-
-# Build frontend + server
-pnpm run build
-```
-
-The MCP server is typically started by your MCP client — see [Configuration](#configuration). To run manually:
-
-```bash
-node dist/index.js
-```
-
-This starts the MCP server (stdio) **and** the canvas server. Open `http://localhost:3000` in your browser.
-
-## Quick Start (Docker)
-
-Canvas server:
-```bash
-docker run -d -p 3000:3000 --name mcp-excalidraw-canvas sanjibdevnath/mcp-excalidraw-local-canvas:latest
-```
-
-MCP server (stdio) is typically launched by your MCP client. If you want a local container, use `sanjibdevnath/mcp-excalidraw-local:latest`.
-
-## Configuration
-
-This is a standard MCP server communicating over **stdio**. It works with any MCP-compatible client (Cursor, Claude Desktop, Claude Code, Codex CLI, OpenCode, Gemini, or any other agent that supports the Model Context Protocol).
-
-### JSON config (most clients)
-
-Add this to your client's MCP configuration file:
-
-```json
-{
-  "mcpServers": {
-    "excalidraw-canvas": {
-      "command": "node",
-      "args": ["/absolute/path/to/mcp-excalidraw-local/dist/index.js"],
-      "env": {
-        "CANVAS_PORT": "3000"
-      }
-    }
-  }
-}
-```
-
-Replace `/absolute/path/to/mcp-excalidraw-local` with the actual path where you cloned and built the repo.
-
-### CLI-based registration
-
-```bash
-# Example for Claude Code
-claude mcp add excalidraw-canvas --scope user \
-  -e CANVAS_PORT=3000 \
-  -- node /absolute/path/to/mcp-excalidraw-local/dist/index.js
-```
-
-### Docker
-
-```json
-{
-  "mcpServers": {
-    "excalidraw-canvas": {
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "CANVAS_PORT=3000",
-        "sanjibdevnath/mcp-excalidraw-local:latest"
-      ]
-    }
-  }
-}
-```
-
-> **Note:** For Docker on Linux, you may need `--add-host=host.docker.internal:host-gateway`.
-
-### Key points
-
-- **Single process** — The canvas server is embedded. No separate terminal or process needed.
-- **Browser required for screenshots** — `export_to_image` and `get_canvas_screenshot` rely on the frontend. Open `http://localhost:3000` in a browser.
-
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -272,7 +337,6 @@ claude mcp add excalidraw-canvas --scope user \
 | `EXCALIDRAW_DB_PATH` | Path to the SQLite database file | `~/.excalidraw-mcp/excalidraw.db` |
 | `EXCALIDRAW_EXPORT_DIR` | Allowed directory for file exports | `process.cwd()` |
 | `EXPRESS_SERVER_URL` | Canvas server URL (only if running canvas separately) | `http://localhost:3000` |
-| `ENABLE_CANVAS_SYNC` | Enable real-time canvas sync | `true` |
 
 ## Multi-Tenancy (Workspaces)
 
@@ -297,49 +361,30 @@ This repo includes a skill at `skills/excalidraw-skill/` that provides:
 - **Cheatsheet** (`references/cheatsheet.md`): MCP tool and REST API reference for all 32 tools
 - **Helper scripts** (`scripts/*.cjs`): export, import, clear, healthcheck, CRUD operations
 
-The skill complements the MCP server by giving your AI agent structured workflows to follow.
+### Install via Setup Wizard
 
-### Install the Skill
+The easiest way to install the skill:
+
+```bash
+npx @sanjibdevnath/mcp-excalidraw-local setup
+```
+
+The wizard detects your installed agents and lets you choose which ones get the skill.
+
+### Install Manually
 
 Copy the skill folder to your agent's skill directory:
 
 ```bash
-# Claude Code
-mkdir -p ~/.claude/skills
-cp -R skills/excalidraw-skill ~/.claude/skills/excalidraw-skill
-
 # Cursor
-mkdir -p ~/.cursor/skills
 cp -R skills/excalidraw-skill ~/.cursor/skills/excalidraw-skill
 
+# Claude Code
+cp -R skills/excalidraw-skill ~/.claude/skills/excalidraw-skill
+
 # Codex CLI
-mkdir -p ~/.codex/skills
 cp -R skills/excalidraw-skill ~/.codex/skills/excalidraw-skill
-
-# Or any agent that supports a skills directory
-cp -R skills/excalidraw-skill /path/to/your/agent/skills/
 ```
-
-To update an existing installation, remove the old folder first then re-copy.
-
-### Use the Skill Scripts
-
-All scripts respect `EXPRESS_SERVER_URL` (default `http://localhost:3000`) or accept `--url`.
-
-```bash
-EXPRESS_SERVER_URL=http://127.0.0.1:3000 node skills/excalidraw-skill/scripts/healthcheck.cjs
-EXPRESS_SERVER_URL=http://127.0.0.1:3000 node skills/excalidraw-skill/scripts/export-elements.cjs --out diagram.elements.json
-EXPRESS_SERVER_URL=http://127.0.0.1:3000 node skills/excalidraw-skill/scripts/import-elements.cjs --in diagram.elements.json --mode batch
-```
-
-### When the Skill Is Useful
-
-- **Repository workflow**: export elements as JSON, commit it, and re-import later
-- **Reliable refactors**: clear + re-import in `sync` mode to make canvas match a file
-- **Automated smoke tests**: create/update/delete a known element to validate a deployment
-- **Repeatable diagrams**: keep a library of element JSON snippets and import them
-
-See `skills/excalidraw-skill/SKILL.md` and `skills/excalidraw-skill/references/cheatsheet.md`.
 
 ## MCP Tools (32 Total)
 
@@ -385,27 +430,94 @@ npx @modelcontextprotocol/inspector --cli \
   --tool-arg width=300 --tool-arg height=200
 ```
 
-### Frontend Screenshots
-
-If you use a browser automation tool for UI checks:
-```bash
-# Open the canvas and take a screenshot for verification
-open http://127.0.0.1:3000
-# Or use agent-browser, Playwright, Puppeteer, etc.
-```
-
 ## Troubleshooting
 
-- **Canvas not loading**: Ensure `CANVAS_PORT` isn't occupied by another process. Check `lsof -i :3000`.
-- **Canvas not updating**: Confirm the MCP process is running and the browser is connected (check the status dot in the header).
-- **Wrong workspace shown**: The MCP uses `server.listRoots()` to detect the workspace. Restart your MCP client if the workspace changed.
-- **Elements missing after restart**: Check `~/.excalidraw-mcp/excalidraw.db` exists. If you previously ran the upstream (in-memory) version, data wasn't persisted.
-- **Port conflict with multiple instances**: Set different `CANVAS_PORT` values for each workspace, or rely on multi-tenancy (same port, different tenants).
-- **Updates/deletes fail after batch creation**: Ensure you are on a build that includes the batch id preservation fix.
+### `better-sqlite3` compilation failure
+
+This is the most common installation issue. `better-sqlite3` is a native Node.js module that requires C++ build tools.
+
+**Symptoms:**
+- `npm install` fails with `gyp ERR!` or `prebuild-install` errors
+- `npx` command fails during installation
+- Error: `Cannot find module 'better-sqlite3'` at runtime
+
+**Fix:**
+
+1. Install build tools for your platform (see [Prerequisites](#prerequisites))
+2. Rebuild the module:
+   ```bash
+   npm rebuild better-sqlite3
+   ```
+3. Or run the setup wizard which handles this automatically:
+   ```bash
+   npx @sanjibdevnath/mcp-excalidraw-local setup
+   ```
+
+### EADDRINUSE (port already in use)
+
+**Symptom:** Error `listen EADDRINUSE: address already in use :::3000`
+
+**Fix:**
+```bash
+# Find what's using the port
+lsof -i :3000
+
+# Either kill the process or use a different port
+CANVAS_PORT=3001 node dist/index.js
+```
+
+> The MCP server automatically detects and reuses an existing healthy canvas server on the same port, so this error is rare.
+
+### Canvas not loading / "Frontend not found"
+
+**Symptom:** Browser shows "Frontend not found" or blank page at `http://localhost:3000`
+
+**Fix:**
+```bash
+npm run build        # builds both frontend and server
+node dist/index.js   # restart
+```
+
+### NVM / path issues with npx
+
+**Symptom:** `npx @sanjibdevnath/mcp-excalidraw-local` hangs or uses the wrong Node version.
+
+**Fix:**
+```bash
+# Ensure you're using a supported Node version
+nvm use 20  # or 22
+
+# Clear npm cache if npx is stale
+npm cache clean --force
+
+# Try with explicit node path in your MCP config
+which node  # copy this path
+```
+
+Then use the full path in your MCP config:
+```json
+{
+  "mcpServers": {
+    "excalidraw-canvas": {
+      "command": "/Users/you/.nvm/versions/node/v22.12.0/bin/npx",
+      "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local"],
+      "env": { "CANVAS_PORT": "3000" }
+    }
+  }
+}
+```
+
+### Canvas not updating / elements not syncing
+
+**Fix:**
+- Confirm the MCP process is running and the browser is connected (check the green status dot in the header)
+- Click the "Sync" button in the canvas header for a manual sync
+
+### Wrong workspace shown
+
+The MCP uses `server.listRoots()` to detect the workspace. Restart your MCP client if the workspace changed.
 
 ## Known Issues / TODO
-
-All previously listed bugs from the upstream have been fixed. Remaining items:
 
 - [ ] **Image export requires a browser**: `export_to_image` and `get_canvas_screenshot` rely on the frontend rendering. The canvas UI must be open in a browser.
 - [ ] **`export_to_excalidraw_url` blocked**: Organizations that block `excalidraw.com` cannot use shareable URL export. Use `export_scene` for local `.excalidraw` files instead.
@@ -416,13 +528,13 @@ Contributions welcome!
 
 ```bash
 # Type check
-pnpm run type-check
+npm run type-check
 
 # Full build (frontend + server)
-pnpm run build
+npm run build
 
 # Dev mode (watch)
-pnpm run dev
+npm run dev
 ```
 
 ### Database
@@ -442,10 +554,13 @@ The canvas server exposes a REST API alongside the WebSocket interface:
 | POST | `/api/elements` | Create an element |
 | PUT | `/api/elements/:id` | Update an element |
 | DELETE | `/api/elements/:id` | Delete an element |
+| DELETE | `/api/elements/clear` | Clear all elements |
 | POST | `/api/elements/sync` | Sync all elements (bulk upsert) |
 | GET | `/api/tenants` | List all tenants |
 | GET | `/api/tenant/active` | Get the active tenant |
 | PUT | `/api/tenant/active` | Set the active tenant |
+| GET | `/api/settings/:key` | Read a setting |
+| PUT | `/api/settings/:key` | Write a setting |
 
 All endpoints accept an `X-Tenant-Id` header for per-request tenant scoping.
 

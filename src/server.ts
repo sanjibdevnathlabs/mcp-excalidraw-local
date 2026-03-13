@@ -18,10 +18,13 @@ import {
   BatchCreatedMessage,
   SyncStatusMessage,
   InitialElementsMessage,
-  Snapshot
+  Snapshot,
+  normalizeFontFamily,
+  ExcalidrawFile,
+  files
 } from './types.js';
 import * as store from './db.js';
-import { listTenants as dbListTenants, getActiveTenant as dbGetActiveTenant, setActiveTenant as dbSetActiveTenant, getDefaultProjectForTenant } from './db.js';
+import { initDb, listTenants as dbListTenants, getActiveTenant as dbGetActiveTenant, setActiveTenant as dbSetActiveTenant, getDefaultProjectForTenant } from './db.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
 
@@ -86,6 +89,15 @@ wss.on('connection', (ws: WebSocket) => {
     elements: store.getAllElements()
   };
   ws.send(JSON.stringify(initialMessage));
+
+  // Send any stored files (image data)
+  if (files.size > 0) {
+    const allFiles: Record<string, ExcalidrawFile> = {};
+    for (const [id, file] of files) {
+      allFiles[id] = file;
+    }
+    ws.send(JSON.stringify({ type: 'files_added', files: allFiles }));
+  }
   
   // Send sync status to new client
   const syncMessage: SyncStatusMessage = {
@@ -108,7 +120,7 @@ wss.on('connection', (ws: WebSocket) => {
 
 // Schema validation
 const CreateElementSchema = z.object({
-  id: z.string().optional(), // Allow passing ID for MCP sync
+  id: z.string().optional(),
   type: z.enum(Object.values(EXCALIDRAW_ELEMENT_TYPES) as [ExcalidrawElementType, ...ExcalidrawElementType[]]),
   x: z.number(),
   y: z.number(),
@@ -121,11 +133,12 @@ const CreateElementSchema = z.object({
   roughness: z.number().optional(),
   opacity: z.number().optional(),
   text: z.string().optional(),
+  originalText: z.string().optional(),
   label: z.object({
     text: z.string()
   }).optional(),
   fontSize: z.number().optional(),
-  fontFamily: z.string().optional(),
+  fontFamily: z.union([z.string(), z.number()]).optional(),
   groupIds: z.array(z.string()).optional(),
   locked: z.boolean().optional(),
   roundness: z.object({ type: z.number(), value: z.number().optional() }).nullable().optional(),
@@ -136,7 +149,14 @@ const CreateElementSchema = z.object({
   end: z.object({ id: z.string() }).optional(),
   startArrowhead: z.string().nullable().optional(),
   endArrowhead: z.string().nullable().optional(),
+  startBinding: z.any().nullable().optional(),
+  endBinding: z.any().nullable().optional(),
+  boundElements: z.any().nullable().optional(),
   elbowed: z.boolean().optional(),
+  // Image element properties
+  fileId: z.string().optional(),
+  status: z.string().optional(),
+  scale: z.tuple([z.number(), z.number()]).optional(),
 });
 
 const UpdateElementSchema = z.object({
@@ -153,11 +173,12 @@ const UpdateElementSchema = z.object({
   roughness: z.number().optional(),
   opacity: z.number().optional(),
   text: z.string().optional(),
+  originalText: z.string().optional(),
   label: z.object({
     text: z.string()
   }).optional(),
   fontSize: z.number().optional(),
-  fontFamily: z.string().optional(),
+  fontFamily: z.union([z.string(), z.number()]).optional(),
   groupIds: z.array(z.string()).optional(),
   locked: z.boolean().optional(),
   roundness: z.object({ type: z.number(), value: z.number().optional() }).nullable().optional(),
@@ -170,7 +191,13 @@ const UpdateElementSchema = z.object({
   end: z.object({ id: z.string() }).optional(),
   startArrowhead: z.string().nullable().optional(),
   endArrowhead: z.string().nullable().optional(),
+  startBinding: z.any().nullable().optional(),
+  endBinding: z.any().nullable().optional(),
+  boundElements: z.any().nullable().optional(),
   elbowed: z.boolean().optional(),
+  fileId: z.string().optional(),
+  status: z.string().optional(),
+  scale: z.tuple([z.number(), z.number()]).optional(),
 });
 
 // API Routes
@@ -202,9 +229,11 @@ app.post('/api/elements', (req: Request, res: Response) => {
     logger.info('Creating element via API', { type: params.type });
 
     const id = params.id || generateId();
+    const normalizedFont = normalizeFontFamily(params.fontFamily);
     const element: ServerElement = {
       id,
       ...params,
+      ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       version: 1
@@ -253,9 +282,11 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       });
     }
 
+    const normalizedFont = normalizeFontFamily(updates.fontFamily);
     const updatedElement: ServerElement = {
       ...existingElement,
       ...updates,
+      ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
       updatedAt: new Date().toISOString(),
       version: (existingElement.version || 0) + 1
     };
@@ -526,11 +557,9 @@ function resolveArrowBindings(batchElements: ServerElement[], projectId?: string
     el.y = finalStart.y;
     el.points = [[0, 0], [finalEnd.x - finalStart.x, finalEnd.y - finalStart.y]];
 
-    // Remove start/end refs (they were used for computation only)
-    delete (el as any).start;
-    delete (el as any).end;
-
-    // Set binding metadata for Excalidraw
+    // Keep start/end refs on the element — the frontend's
+    // convertToExcalidrawElements uses them to compute proper bindings
+    // (focus, gap, fixedPoint). Also set basic binding metadata for export.
     if (startEl) {
       (el as any).startBinding = {
         elementId: startEl.id,
@@ -566,9 +595,11 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
     elementsToCreate.forEach(elementData => {
       const params = CreateElementSchema.parse(elementData);
       const id = params.id || generateId();
+      const normalizedFont = normalizeFontFamily(params.fontFamily);
       const element: ServerElement = {
         id,
         ...params,
+        ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         version: 1
@@ -711,6 +742,70 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       error: (error as Error).message,
       details: 'Internal server error during sync operation'
     });
+  }
+});
+
+// ── Files API (image element data) ──
+
+// Get all files
+app.get('/api/files', (_req: Request, res: Response) => {
+  try {
+    const allFiles: Record<string, ExcalidrawFile> = {};
+    for (const [id, file] of files) {
+      allFiles[id] = file;
+    }
+    res.json({ success: true, files: allFiles });
+  } catch (error) {
+    logger.error('Error fetching files:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Add files (image data)
+app.post('/api/files', (req: Request, res: Response) => {
+  try {
+    const incoming = req.body.files;
+    if (!incoming || typeof incoming !== 'object') {
+      return res.status(400).json({ success: false, error: 'files object is required' });
+    }
+
+    const addedIds: string[] = [];
+    for (const [id, fileData] of Object.entries(incoming)) {
+      const file = fileData as ExcalidrawFile;
+      files.set(id, {
+        id,
+        mimeType: file.mimeType || 'image/png',
+        dataURL: file.dataURL,
+        created: file.created || Date.now(),
+      });
+      addedIds.push(id);
+    }
+
+    broadcast({
+      type: 'files_added',
+      files: incoming
+    });
+
+    res.json({ success: true, addedIds, count: addedIds.length });
+  } catch (error) {
+    logger.error('Error adding files:', error);
+    res.status(400).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Delete a file
+app.delete('/api/files/:id', (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!files.has(id!)) {
+      return res.status(404).json({ success: false, error: `File ${id} not found` });
+    }
+    files.delete(id!);
+    broadcast({ type: 'file_deleted', fileId: id });
+    res.json({ success: true, message: `File ${id} deleted` });
+  } catch (error) {
+    logger.error('Error deleting file:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
   }
 });
 
@@ -1052,6 +1147,34 @@ app.put('/api/tenant/active', (req: Request, res: Response) => {
   }
 });
 
+// ── Settings API ──
+
+app.get('/api/settings/:key', (req: Request, res: Response) => {
+  try {
+    const { key } = req.params;
+    const value = store.getSetting(key!);
+    res.json({ success: true, key, value: value ?? null });
+  } catch (error) {
+    logger.error('Error reading setting:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.put('/api/settings/:key', (req: Request, res: Response) => {
+  try {
+    const { key } = req.params;
+    const { value } = req.body;
+    if (value === undefined || value === null) {
+      return res.status(400).json({ success: false, error: 'value is required' });
+    }
+    store.setSetting(key!, String(value));
+    res.json({ success: true, key, value: String(value) });
+  } catch (error) {
+    logger.error('Error writing setting:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
   const projId = resolveTenantProject(req);
@@ -1099,6 +1222,10 @@ export function isCanvasServerOwned(): boolean {
 }
 
 export async function startCanvasServer(): Promise<void> {
+  // Ensure the database is initialized when running standalone (e.g. Docker: `node dist/server.js`).
+  // When launched via index.ts (MCP entry point), initDb() is a no-op on the second call.
+  initDb();
+
   // Pre-flight: check if an existing healthy canvas server is already on this port.
   // We do this BEFORE calling httpServer.listen() because Node's listen() can emit
   // EADDRINUSE as an uncaught exception that bypasses our error handler.

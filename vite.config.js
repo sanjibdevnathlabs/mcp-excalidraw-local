@@ -7,6 +7,18 @@ export default defineConfig({
   build: {
     outDir: '../dist/frontend',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (
+            id.includes('@excalidraw/excalidraw') &&
+            id.includes('subset')
+          ) {
+            return id.split('/').pop()?.replace(/\.[^.]+$/, '');
+          }
+        },
+      },
+    },
   },
   server: {
     port: 5173,

@@ -46,12 +46,13 @@ RUN apt-get purge -y python3 make g++ && apt-get autoremove -y
 COPY --from=backend-builder /app/dist ./dist
 COPY --from=frontend-builder /app/dist/frontend ./dist/frontend
 
-RUN chown -R nodejs:nodejs /app
+RUN mkdir -p /app/data && chown -R nodejs:nodejs /app
 USER nodejs
 
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
+ENV EXCALIDRAW_DB_PATH=/app/data/excalidraw.db
 
 EXPOSE 3000
 

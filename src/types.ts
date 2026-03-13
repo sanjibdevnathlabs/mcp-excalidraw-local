@@ -106,7 +106,7 @@ export interface ExcalidrawBinding {
   fixedPoint?: readonly [number, number] | null;
 }
 
-export type ExcalidrawElementType = 'rectangle' | 'ellipse' | 'diamond' | 'arrow' | 'text' | 'line' | 'freedraw';
+export type ExcalidrawElementType = 'rectangle' | 'ellipse' | 'diamond' | 'arrow' | 'text' | 'line' | 'freedraw' | 'image';
 
 // Excalidraw element types
 export const EXCALIDRAW_ELEMENT_TYPES: Record<string, ExcalidrawElementType> = {
@@ -116,7 +116,8 @@ export const EXCALIDRAW_ELEMENT_TYPES: Record<string, ExcalidrawElementType> = {
   ARROW: 'arrow',
   TEXT: 'text',
   FREEDRAW: 'freedraw',
-  LINE: 'line'
+  LINE: 'line',
+  IMAGE: 'image'
 } as const;
 
 // Server-side element with metadata
@@ -136,9 +137,16 @@ export interface ServerElement extends Omit<ExcalidrawElementBase, 'id'> {
     text: string;
   };
   points?: any;
+  originalText?: string;
   // Arrow element binding: connect arrows to shapes by element ID
   start?: { id: string };
   end?: { id: string };
+  startBinding?: ExcalidrawBinding | null;
+  endBinding?: ExcalidrawBinding | null;
+  // Image element properties
+  fileId?: string;
+  status?: string;
+  scale?: [number, number];
 }
 
 // API Response types
@@ -183,7 +191,9 @@ export type WebSocketMessageType =
   | 'canvas_cleared'
   | 'export_image_request'
   | 'set_viewport'
-  | 'tenant_switched';
+  | 'tenant_switched'
+  | 'files_added'
+  | 'file_deleted';
 
 export interface InitialElementsMessage extends WebSocketMessage {
   type: 'initial_elements';
@@ -287,6 +297,46 @@ export interface Snapshot {
   name: string;
   elements: ServerElement[];
   createdAt: string;
+}
+
+// Excalidraw file (image) data — stored in-memory alongside element data
+export interface ExcalidrawFile {
+  mimeType: string;
+  id: string;
+  dataURL: string;
+  created: number;
+  lastRetrieved?: number;
+}
+
+// In-memory file storage (image files are too large for SQLite row storage)
+export const files = new Map<string, ExcalidrawFile>();
+
+// Font family normalization: Excalidraw expects numeric IDs, but agents
+// often send string names. Map common names to their numeric equivalents.
+const FONT_FAMILY_MAP: Record<string, number> = {
+  'virgil': 1,
+  'hand-drawn': 1,
+  'excalifont': 1,
+  'helvetica': 2,
+  'arial': 2,
+  'sans-serif': 2,
+  'cascadia': 3,
+  'monospace': 3,
+  'courier': 3,
+  'comic shanns': 4,
+  'comic sans': 4,
+  'liberation sans': 5,
+  'nunito': 6,
+  'lilita one': 7,
+};
+
+export function normalizeFontFamily(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'number') return value;
+  const mapped = FONT_FAMILY_MAP[value.toLowerCase().trim()];
+  if (mapped !== undefined) return mapped;
+  const parsed = parseInt(value, 10);
+  return isNaN(parsed) ? 1 : parsed;
 }
 
 // Storage is now handled by src/db.ts (SQLite).

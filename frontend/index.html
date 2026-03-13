@@ -410,6 +410,51 @@
             color: #aaa;
             font-size: 13px;
         }
+
+        /* Clear canvas confirmation dialog */
+        .confirm-dialog {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 360px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 12px 40px rgba(0,0,0,0.22);
+            padding: 24px;
+        }
+        .confirm-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #333;
+            margin-bottom: 8px;
+        }
+        .confirm-msg {
+            font-size: 14px;
+            color: #666;
+            margin: 0 0 16px;
+            line-height: 1.4;
+        }
+        .confirm-checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            color: #555;
+            cursor: pointer;
+            margin-bottom: 20px;
+            font-weight: 400;
+        }
+        .confirm-checkbox-label input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+        .confirm-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
     </style>
 </head>
 <body>

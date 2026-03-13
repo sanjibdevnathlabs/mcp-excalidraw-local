@@ -2,22 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
-    name: Build and Type Check
+    name: Build & Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
         node-version: [18.x, 20.x, 22.x]
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
@@ -28,36 +30,34 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run TypeScript type check
+      - name: Type check
         run: npm run type-check
 
-      - name: Build project
+      - name: Build
         run: npm run build
+
+      - name: Unit & integration tests
+        run: npm test
 
       - name: Check build artifacts
         run: |
-          echo "Checking if build artifacts exist..."
-          test -f dist/index.js || (echo "dist/index.js not found" && exit 1)
-          test -f dist/server.js || (echo "dist/server.js not found" && exit 1)
-          test -d dist/frontend || (echo "dist/frontend not found" && exit 1)
-          echo "All build artifacts present!"
+          test -f dist/index.js
+          test -f dist/server.js
+          test -d dist/frontend
 
       - name: Upload build artifacts
         if: matrix.node-version == '20.x'
         uses: actions/upload-artifact@v4
         with:
           name: build-artifacts
-          path: |
-            dist/
+          path: dist/
           retention-days: 7
 
   lint-check:
     name: Lint Check
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -71,11 +71,46 @@ jobs:
       - name: Check for TypeScript errors
         run: npm run type-check
 
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Install Playwright browsers
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          EXCALIDRAW_DB_PATH: /tmp/excalidraw-e2e-ci.db
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
   ci-status:
     runs-on: ubuntu-latest
     continue-on-error: false
     name: CI Status Check
-    needs: [build-and-test, lint-check]
+    needs: [build-and-test, lint-check, e2e]
     if: always()
     permissions:
       statuses: write

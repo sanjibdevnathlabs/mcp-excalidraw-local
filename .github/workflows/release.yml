@@ -1,0 +1,282 @@
+name: Release & Publish
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # Gate: only release if CI passed and there are releasable commits
+  check:
+    name: Check for releasable commits
+    runs-on: ubuntu-latest
+    outputs:
+      bump: ${{ steps.bump.outputs.bump }}
+      new_version: ${{ steps.bump.outputs.new_version }}
+      changelog: ${{ steps.bump.outputs.changelog }}
+      should_release: ${{ steps.bump.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump from conventional commits
+        id: bump
+        run: |
+          # Find the latest semver tag
+          LATEST_TAG=$(git tag --list 'v*' --sort=-version:refname | head -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG=$(git rev-list --max-parents=0 HEAD)
+            echo "No tags found, using first commit"
+          fi
+          echo "Latest tag: $LATEST_TAG"
+
+          # Get commit messages since last tag
+          COMMITS=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits since $LATEST_TAG"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Skip if the only commit is a version bump
+          NON_RELEASE_COMMITS=$(echo "$COMMITS" | grep -v "^chore(release):" || true)
+          if [ -z "$NON_RELEASE_COMMITS" ]; then
+            echo "Only release commits found, skipping"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Commits since $LATEST_TAG:"
+          echo "$COMMITS"
+
+          # Determine bump type from conventional commit prefixes
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qiE "^.*(BREAKING[ -]CHANGE|!)(\(.+\))?:"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qiE "^(feat|feature)(\(.+\))?:"; then
+            BUMP="minor"
+          elif echo "$COMMITS" | grep -qiE "^✨"; then
+            BUMP="minor"
+          fi
+
+          # Read current version and compute new one
+          CURRENT=$(node -p "require('./package.json').version")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "$BUMP" in
+            major) NEW_VERSION="$((MAJOR+1)).0.0" ;;
+            minor) NEW_VERSION="$MAJOR.$((MINOR+1)).0" ;;
+            patch) NEW_VERSION="$MAJOR.$MINOR.$((PATCH+1))" ;;
+          esac
+
+          echo "Current: $CURRENT → New: $NEW_VERSION ($BUMP)"
+
+          # Build changelog from conventional commits
+          CHANGELOG=""
+          BREAKING=$(echo "$COMMITS" | grep -iE "^.*(BREAKING[ -]CHANGE|!)(\(.+\))?:" || true)
+          FEATURES=$(echo "$COMMITS" | grep -iE "^(feat|feature|✨)" || true)
+          FIXES=$(echo "$COMMITS" | grep -iE "^(fix|🐛)" || true)
+          OTHERS=$(echo "$COMMITS" | grep -viE "^(feat|feature|✨|fix|🐛|chore\(release\))" | grep -viE "BREAKING" || true)
+
+          if [ -n "$BREAKING" ]; then
+            CHANGELOG="$CHANGELOG
+          ### ⚠️ Breaking Changes
+          $(echo "$BREAKING" | sed 's/^/- /')"
+          fi
+          if [ -n "$FEATURES" ]; then
+            CHANGELOG="$CHANGELOG
+          ### ✨ Features
+          $(echo "$FEATURES" | sed 's/^/- /')"
+          fi
+          if [ -n "$FIXES" ]; then
+            CHANGELOG="$CHANGELOG
+          ### 🐛 Bug Fixes
+          $(echo "$FIXES" | sed 's/^/- /')"
+          fi
+          if [ -n "$OTHERS" ]; then
+            CHANGELOG="$CHANGELOG
+          ### 📦 Other Changes
+          $(echo "$OTHERS" | sed 's/^/- /')"
+          fi
+
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+          # Multi-line output for changelog
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            echo "$CHANGELOG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Pre-release tests
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit & integration tests
+        run: npm test
+
+  release:
+    name: Version bump & release
+    needs: [check, test]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ needs.check.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version in package.json
+        run: |
+          npm version ${{ needs.check.outputs.new_version }} --no-git-tag-version
+          git add package.json package-lock.json
+          git commit -m "chore(release): v${{ needs.check.outputs.new_version }}"
+          git tag "v${{ needs.check.outputs.new_version }}"
+
+      - name: Push version commit and tag
+        run: |
+          git push origin main
+          git push origin "v${{ needs.check.outputs.new_version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.new_version }}
+          name: v${{ needs.check.outputs.new_version }}
+          body: |
+            ## What's Changed in v${{ needs.check.outputs.new_version }}
+            ${{ needs.check.outputs.changelog }}
+
+            **Full Changelog**: https://github.com/${{ github.repository }}/compare/v${{ needs.check.outputs.new_version }}...v${{ needs.check.outputs.new_version }}
+
+            ---
+            ```
+            npm install @sanjibdevnath/mcp-excalidraw-local@${{ needs.check.outputs.new_version }}
+            ```
+          draft: false
+          prerelease: false
+
+  publish-npm:
+    name: Publish to NPM
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Check if version already on NPM
+        id: check-npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view @sanjibdevnath/mcp-excalidraw-local@$VERSION version 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to NPM
+        if: steps.check-npm.outputs.exists == 'false'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Published
+        if: steps.check-npm.outputs.exists == 'false'
+        run: echo "✅ Published v$(node -p "require('./package.json').version") to NPM"
+
+      - name: Skipped (already exists)
+        if: steps.check-npm.outputs.exists == 'true'
+        run: echo "⚠️ Version already on NPM, skipping"
+
+  publish-docker:
+    name: Build & push Docker images
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push MCP Server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            sanjibdevnath/mcp-excalidraw-local:latest
+            sanjibdevnath/mcp-excalidraw-local:v${{ needs.release.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Build and push Canvas Server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.canvas
+          push: true
+          tags: |
+            sanjibdevnath/mcp-excalidraw-local-canvas:latest
+            sanjibdevnath/mcp-excalidraw-local-canvas:v${{ needs.release.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
