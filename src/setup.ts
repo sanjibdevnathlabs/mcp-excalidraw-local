@@ -55,6 +55,7 @@ interface AgentDef {
   skillBasePaths: { global: string; local: string };
   mcpConfigType: 'json-file' | 'cli-command';
   mcpConfigPath?: string;
+  mcpCliRemove?: string;
   mcpCliCommand?: string;
 }
 
@@ -79,7 +80,8 @@ function getAgents(): AgentDef[] {
         local: path.join(process.cwd(), '.claude', 'skills'),
       },
       mcpConfigType: 'cli-command',
-      mcpCliCommand: 'claude mcp add excalidraw-canvas --scope user -e CANVAS_PORT=3000 -- npx -y @sanjibdevnath/mcp-excalidraw-local',
+      mcpCliRemove: 'claude mcp remove excalidraw-canvas --scope user',
+      mcpCliCommand: 'claude mcp add excalidraw-canvas --scope user -e CANVAS_PORT=3000 -- npx -y @sanjibdevnath/mcp-excalidraw-local@latest',
     },
     {
       name: 'Codex CLI',
@@ -285,6 +287,9 @@ async function phaseMcpConfig(rl: readline.Interface): Promise<void> {
       }
 
       try {
+        if (agent.mcpCliRemove) {
+          try { execSync(agent.mcpCliRemove, { stdio: 'pipe' }); } catch { /* ignore if not found */ }
+        }
         execSync(agent.mcpCliCommand, { stdio: 'inherit' });
         ok(`Registered 'excalidraw-canvas' via ${agent.name} CLI`);
       } catch (err) {
@@ -299,7 +304,7 @@ async function phaseMcpConfig(rl: readline.Interface): Promise<void> {
 function mergeJsonConfig(configPath: string): void {
   const mcpEntry = {
     command: 'npx',
-    args: ['-y', '@sanjibdevnath/mcp-excalidraw-local'],
+    args: ['-y', '@sanjibdevnath/mcp-excalidraw-local@latest'],
     env: { CANVAS_PORT: '3000' },
   };
 
@@ -331,6 +336,23 @@ function mergeJsonConfig(configPath: string): void {
   fs.writeFileSync(configPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
 }
 
+function checkJsonConfigStatus(configPath: string): 'up-to-date' | 'needs-update' | 'not-found' {
+  if (!fs.existsSync(configPath)) return 'not-found';
+
+  try {
+    const raw = fs.readFileSync(configPath, 'utf-8');
+    const config = JSON.parse(raw);
+    const entry = config?.mcpServers?.['excalidraw-canvas'];
+    if (!entry) return 'not-found';
+
+    const args: string[] = entry.args ?? [];
+    const hasLatest = args.some((a: string) => a.includes('@latest'));
+    return hasLatest ? 'up-to-date' : 'needs-update';
+  } catch {
+    return 'not-found';
+  }
+}
+
 function printManualConfig(): void {
   process.stdout.write(`
     Manual config (JSON):
@@ -338,7 +360,7 @@ function printManualConfig(): void {
       "mcpServers": {
         "excalidraw-canvas": {
           "command": "npx",
-          "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local"],
+          "args": ["-y", "@sanjibdevnath/mcp-excalidraw-local@latest"],
           "env": { "CANVAS_PORT": "3000" }
         }
       }
@@ -472,33 +494,50 @@ export async function runUpdate(): Promise<void> {
     // ── Phase 2: MCP config check ────────────────────────────
     heading('2/2', 'MCP Configuration');
 
-    const wantConfig = await confirm(rl, 'Re-apply MCP server config? (overwrites existing entry)', false);
-    if (wantConfig) {
-      for (const agent of detectedAgents) {
-        if (agent.mcpConfigType === 'json-file' && agent.mcpConfigPath) {
-          const doIt = await confirm(rl, `${agent.name} — update ${agent.mcpConfigPath}?`);
+    for (const agent of detectedAgents) {
+      if (agent.mcpConfigType === 'json-file' && agent.mcpConfigPath) {
+        const status = checkJsonConfigStatus(agent.mcpConfigPath);
+
+        if (status === 'up-to-date') {
+          ok(`${agent.name} — already uses @latest, auto-updates on restart.`);
+        } else if (status === 'needs-update') {
+          const doIt = await confirm(rl, `${agent.name} — config uses a pinned version. Migrate to @latest?`);
           if (doIt) {
             try {
               mergeJsonConfig(agent.mcpConfigPath);
-              ok(`Updated 'excalidraw-canvas' in ${agent.mcpConfigPath}`);
+              ok(`Migrated to @latest in ${agent.mcpConfigPath}`);
             } catch (err) {
               fail(`Failed: ${(err as Error).message}`);
             }
           }
-        } else if (agent.mcpConfigType === 'cli-command' && agent.mcpCliCommand) {
-          const doIt = await confirm(rl, `${agent.name} — re-register via CLI?`);
+        } else {
+          const doIt = await confirm(rl, `${agent.name} — no MCP config found. Add it?`);
           if (doIt) {
             try {
-              execSync(agent.mcpCliCommand, { stdio: 'inherit' });
-              ok(`Re-registered 'excalidraw-canvas' via ${agent.name} CLI`);
+              mergeJsonConfig(agent.mcpConfigPath);
+              ok(`Added 'excalidraw-canvas' to ${agent.mcpConfigPath}`);
             } catch (err) {
-              fail(`CLI registration failed: ${(err as Error).message}`);
+              fail(`Failed: ${(err as Error).message}`);
             }
           }
         }
+      } else if (agent.mcpConfigType === 'cli-command' && agent.mcpCliCommand) {
+        info(`${agent.name} — config managed via CLI (cannot auto-detect version).`);
+        const doIt = await confirm(rl, `${agent.name} — re-register with @latest?`, false);
+        if (doIt) {
+          try {
+            if (agent.mcpCliRemove) {
+              try { execSync(agent.mcpCliRemove, { stdio: 'pipe' }); } catch { /* ignore if not found */ }
+            }
+            execSync(agent.mcpCliCommand, { stdio: 'inherit' });
+            ok(`Re-registered 'excalidraw-canvas' via ${agent.name} CLI`);
+          } catch (err) {
+            fail(`CLI registration failed: ${(err as Error).message}`);
+          }
+        } else {
+          info(`${DIM}Skipped.${RESET}`);
+        }
       }
-    } else {
-      info(`${DIM}MCP config unchanged.${RESET}`);
     }
 
     process.stdout.write(`\n  ${GREEN}${BOLD}Update complete!${RESET} Restart your MCP client to pick up changes.\n\n`);
