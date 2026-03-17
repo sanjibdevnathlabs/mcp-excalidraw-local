@@ -118,7 +118,7 @@ function detectInstalledAgents(): AgentDef[] {
 // ── Phase 1: Environment Check ──────────────────────────────
 
 async function phaseEnvironment(rl: readline.Interface): Promise<boolean> {
-  heading('1/3', 'Environment');
+  heading('1/4', 'Environment');
   let allOk = true;
 
   // Node.js version
@@ -182,10 +182,103 @@ async function phaseEnvironment(rl: readline.Interface): Promise<boolean> {
   return allOk;
 }
 
+// ── Preference Setup ─────────────────────────────────────────
+
+const FONT_OPTIONS: { value: number; label: string }[] = [
+  { value: 1, label: 'Excalifont (hand-drawn)' },
+  { value: 2, label: 'Helvetica (sans-serif)' },
+  { value: 3, label: 'Cascadia (monospace)' },
+  { value: 4, label: 'Comic Shanns' },
+  { value: 6, label: 'Nunito' },
+  { value: 7, label: 'Lilita One' },
+];
+
+const ROUGHNESS_OPTIONS: { value: number; label: string }[] = [
+  { value: 0, label: 'Clean / professional' },
+  { value: 1, label: 'Hand-drawn sketch' },
+  { value: 2, label: 'Very rough' },
+];
+
+function getGlobalPreferencesPath(): string {
+  return path.join(os.homedir(), '.claude', 'skills', 'excalidraw-skill', 'preferences.json');
+}
+
+function globalPreferencesExist(): boolean {
+  return fs.existsSync(getGlobalPreferencesPath());
+}
+
+function writePreferencesFile(filePath: string, prefs: { fontFamily: number; fontSize: number; roughness: number; strokeWidth: number }): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const content = {
+    defaults: prefs,
+  };
+  fs.writeFileSync(filePath, JSON.stringify(content, null, 2) + '\n', 'utf-8');
+}
+
+async function phasePreferences(rl: readline.Interface, phaseLabel: string): Promise<void> {
+  heading(phaseLabel, 'Diagram Preferences');
+
+  const prefsPath = getGlobalPreferencesPath();
+
+  if (globalPreferencesExist()) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(prefsPath, 'utf-8'));
+      const d = raw?.defaults;
+      if (d) {
+        const fontLabel = FONT_OPTIONS.find(f => f.value === d.fontFamily)?.label ?? `font ${d.fontFamily}`;
+        const roughLabel = ROUGHNESS_OPTIONS.find(r => r.value === d.roughness)?.label ?? `roughness ${d.roughness}`;
+        ok(`Current: ${fontLabel}, ${roughLabel}, fontSize ${d.fontSize}, strokeWidth ${d.strokeWidth}`);
+        const change = await confirm(rl, 'Change preferences?', false);
+        if (!change) return;
+      }
+    } catch {
+      warn(`Could not read ${prefsPath}, will reconfigure.`);
+    }
+  }
+
+  info('These defaults apply to every diagram (font, style, etc.).');
+  info('');
+
+  // Font
+  process.stdout.write('\n  Font family:\n');
+  FONT_OPTIONS.forEach((f, i) => {
+    const marker = f.value === 1 ? ' (default)' : '';
+    process.stdout.write(`    ${CYAN}[${i + 1}]${RESET} ${f.label}${marker}\n`);
+  });
+  const fontAnswer = (await ask(rl, 'Choose [1]: ')).trim();
+  const fontIdx = fontAnswer === '' ? 0 : parseInt(fontAnswer, 10) - 1;
+  const fontFamily = (fontIdx >= 0 && fontIdx < FONT_OPTIONS.length) ? FONT_OPTIONS[fontIdx]!.value : 1;
+
+  // Roughness
+  process.stdout.write('\n  Diagram style:\n');
+  ROUGHNESS_OPTIONS.forEach((r, i) => {
+    const marker = r.value === 0 ? ' (default)' : '';
+    process.stdout.write(`    ${CYAN}[${i + 1}]${RESET} ${r.label}${marker}\n`);
+  });
+  const roughAnswer = (await ask(rl, 'Choose [1]: ')).trim();
+  const roughIdx = roughAnswer === '' ? 0 : parseInt(roughAnswer, 10) - 1;
+  const roughness = (roughIdx >= 0 && roughIdx < ROUGHNESS_OPTIONS.length) ? ROUGHNESS_OPTIONS[roughIdx]!.value : 0;
+
+  const prefs = { fontFamily, fontSize: 20, roughness, strokeWidth: 2 };
+
+  try {
+    writePreferencesFile(prefsPath, prefs);
+    const fontLabel = FONT_OPTIONS.find(f => f.value === fontFamily)?.label ?? `${fontFamily}`;
+    const roughLabel = ROUGHNESS_OPTIONS.find(r => r.value === roughness)?.label ?? `${roughness}`;
+    ok(`Saved: ${fontLabel}, ${roughLabel}`);
+    ok(`File: ${prefsPath}`);
+  } catch (err) {
+    fail(`Failed to save preferences: ${(err as Error).message}`);
+  }
+}
+
 // ── Phase 2: Skill Installation ─────────────────────────────
 
 async function phaseSkillInstall(rl: readline.Interface): Promise<void> {
-  heading('2/3', 'Agent Skill');
+  heading('2/4', 'Agent Skill');
 
   const wantSkill = await confirm(rl, 'Install the Excalidraw agent skill?');
   if (!wantSkill) {
@@ -347,7 +440,7 @@ function writeInstructionDirective(filePath: string, format: 'claude-md' | 'curs
 // ── Phase 3: MCP Configuration ──────────────────────────────
 
 async function phaseMcpConfig(rl: readline.Interface): Promise<void> {
-  heading('3/3', 'MCP Configuration');
+  heading('4/4', 'MCP Configuration');
 
   const wantConfig = await confirm(rl, 'Add MCP server to agent configs automatically?');
   if (!wantConfig) {
@@ -519,7 +612,7 @@ export async function runUpdate(): Promise<void> {
 
   try {
     // ── Phase 1: Detect existing skill installations ──────────
-    heading('1/2', 'Skill Update');
+    heading('1/3', 'Skill Update');
 
     const allInstalls = findExistingSkillInstalls();
     const existing = allInstalls.filter(i => i.exists);
@@ -612,8 +705,11 @@ export async function runUpdate(): Promise<void> {
       }
     }
 
-    // ── Phase 2: MCP config check ────────────────────────────
-    heading('2/2', 'MCP Configuration');
+    // ── Phase 2: Preferences ─────────────────────────────────
+    await phasePreferences(rl, '2/3');
+
+    // ── Phase 3: MCP config check ────────────────────────────
+    heading('3/3', 'MCP Configuration');
 
     for (const agent of detectedAgents) {
       if (agent.mcpConfigType === 'json-file' && agent.mcpConfigPath) {
@@ -685,6 +781,7 @@ export async function runSetup(): Promise<void> {
   try {
     await phaseEnvironment(rl);
     await phaseSkillInstall(rl);
+    await phasePreferences(rl, '3/4');
     await phaseMcpConfig(rl);
 
     process.stdout.write(`\n  ${GREEN}${BOLD}Done!${RESET} Open ${CYAN}http://localhost:3000${RESET} to verify the canvas.\n\n`);
