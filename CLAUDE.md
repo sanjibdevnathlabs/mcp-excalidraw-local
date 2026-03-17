@@ -104,3 +104,12 @@ frontend/      ── React + Excalidraw UI (Vite build → dist/frontend/)
 ## Docker
 
 Two Dockerfiles: `Dockerfile` (MCP server only), `Dockerfile.canvas` (canvas with frontend). `docker-compose.yml` orchestrates both with a `full` profile.
+
+
+## Code Search Optimization
+
+When exploring or understanding code in supported languages (JS, TS, Python, Go, Rust, Java, C, C++, Ruby):
+- Use `smart_search(query, path)` instead of Grep+Glob chains for discovering functions/classes/symbols
+- Use `smart_outline(file_path)` instead of Read to understand file structure (~1-2K tokens vs ~12K+)
+- Use `smart_unfold(file_path, symbol_name)` instead of Read for viewing specific functions (~400-2K tokens)
+- Fall back to Grep for exact string/regex searches, Read for non-code files and files under 100 lines

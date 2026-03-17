@@ -271,3 +271,191 @@ test.describe('Settings via API', () => {
     expect(body.value).toBeNull();
   });
 });
+
+// ─── Sync Version API ───────────────────────────────────────
+
+test.describe('Sync Version API', () => {
+  test('GET /api/sync/version returns initial version', async ({ request }) => {
+    const res = await request.get(`${API}/api/sync/version`);
+    expect(res.ok()).toBe(true);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(typeof body.syncVersion).toBe('number');
+  });
+
+  test('sync version increases after element creation', async ({ request }) => {
+    const beforeRes = await request.get(`${API}/api/sync/version`);
+    const beforeBody = await beforeRes.json();
+    const versionBefore = beforeBody.syncVersion;
+
+    await request.post(`${API}/api/elements`, {
+      data: {
+        id: 'sync-ver-el',
+        type: 'rectangle',
+        x: 10,
+        y: 10,
+        width: 100,
+        height: 50,
+      },
+    });
+
+    const afterRes = await request.get(`${API}/api/sync/version`);
+    const afterBody = await afterRes.json();
+    expect(afterBody.syncVersion).toBeGreaterThan(versionBefore);
+  });
+});
+
+// ─── Delta Sync v2 API ──────────────────────────────────────
+
+test.describe('Delta Sync v2 API', () => {
+  test('accepts empty changes and returns current state', async ({ request }) => {
+    const res = await request.post(`${API}/api/elements/sync/v2`, {
+      data: { lastSyncVersion: 0, changes: [] },
+    });
+    expect(res.ok()).toBe(true);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(typeof body.currentSyncVersion).toBe('number');
+    expect(Array.isArray(body.serverChanges)).toBe(true);
+  });
+
+  test('applies upsert changes via delta sync', async ({ request }) => {
+    const res = await request.post(`${API}/api/elements/sync/v2`, {
+      data: {
+        lastSyncVersion: 0,
+        changes: [
+          {
+            id: 'delta-upsert-1',
+            action: 'upsert',
+            element: {
+              id: 'delta-upsert-1',
+              type: 'rectangle',
+              x: 50,
+              y: 50,
+              width: 120,
+              height: 60,
+            },
+          },
+        ],
+      },
+    });
+    expect(res.ok()).toBe(true);
+    const body = await res.json();
+    expect(body.success).toBe(true);
+    expect(body.appliedCount).toBeGreaterThanOrEqual(1);
+
+    // Verify the element exists via GET
+    const getRes = await request.get(`${API}/api/elements/delta-upsert-1`);
+    expect(getRes.ok()).toBe(true);
+    const getBody = await getRes.json();
+    expect(getBody.element.id).toBe('delta-upsert-1');
+  });
+
+  test('returns server changes for elements created via normal API', async ({ request }) => {
+    // Create an element via the normal REST API
+    await request.post(`${API}/api/elements`, {
+      data: {
+        id: 'normal-api-el',
+        type: 'ellipse',
+        x: 200,
+        y: 200,
+        width: 80,
+        height: 80,
+      },
+    });
+
+    // Now call delta sync with lastSyncVersion: 0 to get all server changes
+    const syncRes = await request.post(`${API}/api/elements/sync/v2`, {
+      data: { lastSyncVersion: 0, changes: [] },
+    });
+    expect(syncRes.ok()).toBe(true);
+    const syncBody = await syncRes.json();
+    expect(syncBody.serverChanges.some((el: any) => el.id === 'normal-api-el')).toBe(true);
+  });
+});
+
+// ─── canvasStatus in API responses ──────────────────────────
+
+test.describe('canvasStatus in API responses', () => {
+  test('element creation response includes canvasStatus', async ({ request }) => {
+    const createRes = await request.post(`${API}/api/elements`, {
+      data: {
+        id: 'status-check-el',
+        type: 'rectangle',
+        x: 300,
+        y: 300,
+        width: 150,
+        height: 75,
+      },
+    });
+    expect(createRes.ok()).toBe(true);
+    const body = await createRes.json();
+
+    // syncedToCanvas should be a boolean
+    expect(typeof body.syncedToCanvas).toBe('boolean');
+
+    // canvasStatus object should be present with expected fields
+    expect(body.canvasStatus).toBeDefined();
+    expect(typeof body.canvasStatus.connectedBrowsers).toBe('number');
+    expect(typeof body.canvasStatus.ackedBy).toBe('number');
+    expect(typeof body.canvasStatus.reason).toBe('string');
+    expect(typeof body.canvasStatus.scope).toBe('string');
+  });
+});
+
+// ─── Real-time Sync with ACK ────────────────────────────────
+
+test.describe('Real-time Sync with ACK', () => {
+  test('syncedToCanvas is true when browser is connected', async ({ page, request }) => {
+    // Open the page and wait for WebSocket connection
+    await page.goto('/');
+    await expect(page.locator('.status span')).toContainText('Connected', { timeout: 5000 });
+    await page.waitForTimeout(500);
+
+    // Create an element via API while browser is connected
+    const createRes = await request.post(`${API}/api/elements`, {
+      data: {
+        id: 'ack-test-rect',
+        type: 'rectangle',
+        x: 400,
+        y: 400,
+        width: 200,
+        height: 100,
+        backgroundColor: '#4ecdc4',
+      },
+    });
+    expect(createRes.ok()).toBe(true);
+    const body = await createRes.json();
+
+    // Browser should have ACKed, so syncedToCanvas should be true
+    expect(body.syncedToCanvas).toBe(true);
+
+    // Also verify the element exists in the backend
+    const verifyRes = await request.get(`${API}/api/elements/ack-test-rect`);
+    expect(verifyRes.ok()).toBe(true);
+    const verifyBody = await verifyRes.json();
+    expect(verifyBody.element.id).toBe('ack-test-rect');
+  });
+
+  test('batch create with browser connected gets ACK', async ({ page, request }) => {
+    // Open the page and wait for WebSocket connection
+    await page.goto('/');
+    await expect(page.locator('.status span')).toContainText('Connected', { timeout: 5000 });
+    await page.waitForTimeout(500);
+
+    // Batch create elements via API while browser is connected
+    const batchRes = await request.post(`${API}/api/elements/batch`, {
+      data: {
+        elements: [
+          { id: 'ack-batch-1', type: 'rectangle', x: 0, y: 0, width: 100, height: 50 },
+          { id: 'ack-batch-2', type: 'ellipse', x: 200, y: 0, width: 80, height: 80 },
+        ],
+      },
+    });
+    expect(batchRes.ok()).toBe(true);
+    const body = await batchRes.json();
+
+    // Browser should have ACKed the batch broadcast
+    expect(body.syncedToCanvas).toBe(true);
+  });
+});

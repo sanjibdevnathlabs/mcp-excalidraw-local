@@ -253,3 +253,201 @@ describe('WebSocket broadcasts', () => {
     ws2.close();
   });
 });
+
+describe('Hello handshake', () => {
+  it('client receives hello_ack after sending hello', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const helloAckPromise = waitForMessageOfType(ws, 'hello_ack');
+
+    ws.send(JSON.stringify({
+      type: 'hello',
+      tenantId: 'default',
+      projectId: 'default',
+    }));
+
+    const msg = await helloAckPromise;
+    expect(msg.type).toBe('hello_ack');
+    expect(msg.tenantId).toBe('default');
+    expect(msg.projectId).toBe('default');
+    expect(Array.isArray(msg.elements)).toBe(true);
+
+    ws.close();
+  });
+
+  it('hello_ack contains elements for the requested project', async () => {
+    setElement('hello-el', {
+      id: 'hello-el', type: 'rectangle', x: 5, y: 10, width: 80, height: 40, version: 1,
+    } as ServerElement);
+
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const helloAckPromise = waitForMessageOfType(ws, 'hello_ack');
+
+    ws.send(JSON.stringify({
+      type: 'hello',
+      tenantId: 'default',
+      projectId: 'default',
+    }));
+
+    const msg = await helloAckPromise;
+    expect(msg.elements.length).toBeGreaterThanOrEqual(1);
+    const found = msg.elements.find((el: any) => el.id === 'hello-el');
+    expect(found).toBeDefined();
+    expect(found.type).toBe('rectangle');
+
+    ws.close();
+  });
+});
+
+describe('Scoped broadcast', () => {
+  it('broadcast reaches all clients in the same default scope', async () => {
+    const ws1 = await connectClient();
+    const ws2 = await connectClient();
+    await drainInitialMessages(ws1);
+    await drainInitialMessages(ws2);
+
+    const promise1 = waitForMessageOfType(ws1, 'element_created');
+    const promise2 = waitForMessageOfType(ws2, 'element_created');
+
+    await fetch(`http://localhost:${port}/api/elements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'rectangle', x: 0, y: 0, width: 30, height: 30 }),
+    });
+
+    const [msg1, msg2] = await Promise.all([promise1, promise2]);
+    expect(msg1.element.type).toBe('rectangle');
+    expect(msg2.element.type).toBe('rectangle');
+    // Both messages should have the same msgId since they came from the same broadcast
+    expect(msg1.msgId).toBe(msg2.msgId);
+
+    ws1.close();
+    ws2.close();
+  });
+});
+
+describe('ACK model', () => {
+  it('mutation broadcasts include msgId', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const createdPromise = waitForMessageOfType(ws, 'element_created');
+
+    await fetch(`http://localhost:${port}/api/elements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'rectangle', x: 0, y: 0, width: 50, height: 50 }),
+    });
+
+    const msg = await createdPromise;
+    expect(msg).toHaveProperty('msgId');
+    expect(typeof msg.msgId).toBe('string');
+    expect(msg.msgId.length).toBeGreaterThan(0);
+
+    ws.close();
+  });
+
+  it('server accepts ack messages without error', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const createdPromise = waitForMessageOfType(ws, 'element_created');
+
+    await fetch(`http://localhost:${port}/api/elements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'ellipse', x: 10, y: 10, width: 40, height: 40 }),
+    });
+
+    const msg = await createdPromise;
+
+    // Send ACK back — should not cause any errors or disconnection
+    ws.send(JSON.stringify({
+      type: 'ack',
+      msgId: msg.msgId,
+      status: 'applied',
+    }));
+
+    // Wait briefly to ensure server processes the ack without crashing
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Verify the connection is still open (readyState 1 = OPEN)
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+
+    ws.close();
+  });
+});
+
+describe('sync_version in broadcasts', () => {
+  it('element_created broadcast includes sync_version', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const createdPromise = waitForMessageOfType(ws, 'element_created');
+
+    await fetch(`http://localhost:${port}/api/elements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'rectangle', x: 0, y: 0, width: 50, height: 50 }),
+    });
+
+    const msg = await createdPromise;
+    expect(msg).toHaveProperty('sync_version');
+    expect(typeof msg.sync_version).toBe('number');
+    expect(msg.sync_version).toBeGreaterThan(0);
+
+    ws.close();
+  });
+
+  it('element_updated broadcast includes sync_version', async () => {
+    setElement('sv-upd', {
+      id: 'sv-upd', type: 'rectangle', x: 0, y: 0, width: 50, height: 50, version: 1,
+    } as ServerElement);
+
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const updatedPromise = waitForMessageOfType(ws, 'element_updated');
+
+    await fetch(`http://localhost:${port}/api/elements/sv-upd`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ x: 500 }),
+    });
+
+    const msg = await updatedPromise;
+    expect(msg).toHaveProperty('sync_version');
+    expect(typeof msg.sync_version).toBe('number');
+    expect(msg.sync_version).toBeGreaterThan(0);
+
+    ws.close();
+  });
+
+  it('elements_batch_created broadcast includes sync_version', async () => {
+    const ws = await connectClient();
+    await drainInitialMessages(ws);
+
+    const batchPromise = waitForMessageOfType(ws, 'elements_batch_created');
+
+    await fetch(`http://localhost:${port}/api/elements/batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        elements: [
+          { type: 'rectangle', x: 0, y: 0, width: 50, height: 50 },
+          { type: 'ellipse', x: 100, y: 100, width: 40, height: 40 },
+        ],
+      }),
+    });
+
+    const msg = await batchPromise;
+    expect(msg).toHaveProperty('sync_version');
+    expect(typeof msg.sync_version).toBe('number');
+    expect(msg.sync_version).toBeGreaterThan(0);
+
+    ws.close();
+  });
+});

@@ -22,10 +22,12 @@ import {
   Snapshot,
   normalizeFontFamily,
   ExcalidrawFile,
-  files
+  files,
+  ClientConnection,
+  BroadcastResult
 } from './types.js';
 import * as store from './db.js';
-import { initDb, listTenants as dbListTenants, getActiveTenant as dbGetActiveTenant, setActiveTenant as dbSetActiveTenant, getDefaultProjectForTenant } from './db.js';
+import { initDb, listTenants as dbListTenants, getActiveTenant as dbGetActiveTenant, setActiveTenant as dbSetActiveTenant, getDefaultProjectForTenant, getCurrentSyncVersion, getChangesSince } from './db.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
 
@@ -57,37 +59,182 @@ function resolveTenantProject(req: Request): string | undefined {
   return getDefaultProjectForTenant(tenantId);
 }
 
-// WebSocket connections
-const clients = new Set<WebSocket>();
-
-// Broadcast to all connected clients
-function broadcast(message: WebSocketMessage): void {
-  const data = JSON.stringify(message);
-  clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data);
-    }
-  });
+// Resolve both tenantId and projectId for scoped broadcast.
+// Falls back to active tenant/project when header is absent.
+function resolveScope(req: Request): { tenantId: string; projectId: string } {
+  const headerTenantId = req.headers['x-tenant-id'] as string | undefined;
+  if (headerTenantId) {
+    const projectId = getDefaultProjectForTenant(headerTenantId) ?? `${headerTenantId}-default`;
+    return { tenantId: headerTenantId, projectId };
+  }
+  // Fallback for browser requests without header
+  const tenant = dbGetActiveTenant();
+  const projectId = getDefaultProjectForTenant(tenant.id) ?? `${tenant.id}-default`;
+  return { tenantId: tenant.id, projectId };
 }
 
-// WebSocket connection handling
-wss.on('connection', (ws: WebSocket) => {
-  clients.add(ws);
-  logger.info('New WebSocket connection established');
+// ── Connection Registry (Task 3) ──────────────────────────────────────────
+// Scoped by tenant → project → Set<ClientConnection>
+const connections = new Map<string, Map<string, Set<ClientConnection>>>();
+// Reverse lookup: ws → ClientConnection (for fast cleanup)
+const wsToConnection = new Map<WebSocket, ClientConnection>();
 
-  // Send current tenant info
-  try {
-    const tenant = dbGetActiveTenant();
-    ws.send(JSON.stringify({
-      type: 'tenant_switched',
-      tenant: { id: tenant.id, name: tenant.name, workspace_path: tenant.workspace_path }
-    }));
-  } catch {}
-  
-  // Send current elements to new client
+function registerConnection(conn: ClientConnection): void {
+  let tenantMap = connections.get(conn.tenantId);
+  if (!tenantMap) {
+    tenantMap = new Map();
+    connections.set(conn.tenantId, tenantMap);
+  }
+  let projectSet = tenantMap.get(conn.projectId);
+  if (!projectSet) {
+    projectSet = new Set();
+    tenantMap.set(conn.projectId, projectSet);
+  }
+  projectSet.add(conn);
+  wsToConnection.set(conn.ws, conn);
+}
+
+function unregisterConnection(ws: WebSocket): void {
+  const conn = wsToConnection.get(ws);
+  if (!conn) return;
+  const tenantMap = connections.get(conn.tenantId);
+  if (tenantMap) {
+    const projectSet = tenantMap.get(conn.projectId);
+    if (projectSet) {
+      projectSet.delete(conn);
+      if (projectSet.size === 0) tenantMap.delete(conn.projectId);
+    }
+    if (tenantMap.size === 0) connections.delete(conn.tenantId);
+  }
+  wsToConnection.delete(ws);
+}
+
+function moveConnection(ws: WebSocket, newTenantId: string, newProjectId: string): void {
+  unregisterConnection(ws);
+  const conn = { ws, tenantId: newTenantId, projectId: newProjectId, connectedAt: Date.now(), identified: true };
+  registerConnection(conn);
+}
+
+function getConnectionsForScope(tenantId: string, projectId: string): Set<ClientConnection> {
+  return connections.get(tenantId)?.get(projectId) ?? new Set();
+}
+
+// ── Scoped Broadcast (Task 5) ─────────────────────────────────────────────
+function broadcastToScope(
+  tenantId: string,
+  projectId: string,
+  message: WebSocketMessage,
+  exclude?: WebSocket
+): BroadcastResult {
+  const msgId = generateId();
+  (message as any).msgId = msgId;
+
+  const scopeConns = getConnectionsForScope(tenantId, projectId);
+  const targets = [...scopeConns].filter(c =>
+    c.ws !== exclude && c.ws.readyState === WebSocket.OPEN
+  );
+
+  if (targets.length === 0) {
+    return { delivered: 0, msgId, reason: 'no_clients_in_scope' };
+  }
+
+  const data = JSON.stringify(message);
+  for (const conn of targets) {
+    conn.ws.send(data);
+  }
+
+  return { delivered: targets.length, msgId };
+}
+
+// ── ACK Tracking (Task 6) ─────────────────────────────────────────────────
+interface AckResult {
+  acked: boolean;
+  delivered: number;
+  reason?: string;
+  ackPayload?: { status: string; elementCount?: number; expectedCount?: number };
+}
+
+interface PendingAck {
+  resolve: (payload: { status: string; elementCount?: number; expectedCount?: number } | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingAcks = new Map<string, PendingAck>();
+
+function resolveAck(msgId: string, payload: { status: string; elementCount?: number; expectedCount?: number }): void {
+  const pending = pendingAcks.get(msgId);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pendingAcks.delete(msgId);
+  pending.resolve(payload);
+}
+
+async function broadcastWithAck(
+  tenantId: string,
+  projectId: string,
+  message: WebSocketMessage,
+  timeoutMs: number = 3000
+): Promise<AckResult> {
+  const br = broadcastToScope(tenantId, projectId, message);
+
+  if (br.delivered === 0) {
+    return { acked: false, delivered: 0, reason: br.reason ?? 'no_clients' };
+  }
+
+  // Wait for first ACK from any client
+  const ackPayload = await new Promise<{ status: string; elementCount?: number; expectedCount?: number } | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingAcks.delete(br.msgId);
+      resolve(null);
+    }, timeoutMs);
+    pendingAcks.set(br.msgId, { resolve, timer });
+  });
+
+  return {
+    acked: ackPayload !== null,
+    delivered: br.delivered,
+    ackPayload: ackPayload ?? undefined,
+    reason: ackPayload ? undefined : 'ack_timeout'
+  };
+}
+
+// Legacy broadcast: sends to ALL connected clients (used for global messages
+// like tenant_switched that aren't scoped to a single project).
+function broadcast(message: WebSocketMessage): void {
+  const data = JSON.stringify(message);
+  for (const conn of wsToConnection.values()) {
+    if (conn.ws.readyState === WebSocket.OPEN) {
+      conn.ws.send(data);
+    }
+  }
+}
+
+// ── WebSocket Connection Handling (Task 4: Hello Handshake) ───────────────
+wss.on('connection', (ws: WebSocket) => {
+  // Register with fallback scope until hello handshake identifies the client.
+  const tenant = (() => { try { return dbGetActiveTenant(); } catch { return { id: 'default', name: 'default', workspace_path: '' }; } })();
+  const fallbackProjectId = getDefaultProjectForTenant(tenant.id) ?? 'default';
+  const conn: ClientConnection = {
+    ws,
+    tenantId: tenant.id,
+    projectId: fallbackProjectId,
+    connectedAt: Date.now(),
+    identified: false
+  };
+  registerConnection(conn);
+  logger.info('New WebSocket connection established (awaiting hello)');
+
+  // Send tenant info so the FE knows where to send hello
+  ws.send(JSON.stringify({
+    type: 'tenant_switched',
+    tenant: { id: tenant.id, name: tenant.name, workspace_path: tenant.workspace_path }
+  }));
+
+  // For backward compatibility: also send initial_elements immediately.
+  // New FE versions will ignore this and use hello_ack instead.
   const initialMessage: InitialElementsMessage = {
     type: 'initial_elements',
-    elements: store.getAllElements()
+    elements: store.getAllElements(fallbackProjectId)
   };
   ws.send(JSON.stringify(initialMessage));
 
@@ -99,23 +246,57 @@ wss.on('connection', (ws: WebSocket) => {
     }
     ws.send(JSON.stringify({ type: 'files_added', files: allFiles }));
   }
-  
+
   // Send sync status to new client
   const syncMessage: SyncStatusMessage = {
     type: 'sync_status',
-    elementCount: store.getElementCount(),
+    elementCount: store.getElementCount(fallbackProjectId),
     timestamp: new Date().toISOString()
   };
   ws.send(JSON.stringify(syncMessage));
-  
+
+  // Handle incoming messages from this client
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'hello') {
+        const helloTenantId = msg.tenantId as string;
+        const helloProjectId = msg.projectId as string;
+        if (helloTenantId && helloProjectId) {
+          // Move connection to the correct scope
+          moveConnection(ws, helloTenantId, helloProjectId);
+          logger.info(`Client identified: tenant=${helloTenantId} project=${helloProjectId}`);
+
+          // Respond with scoped elements
+          const elements = store.getAllElements(helloProjectId);
+          ws.send(JSON.stringify({
+            type: 'hello_ack',
+            tenantId: helloTenantId,
+            projectId: helloProjectId,
+            elements
+          }));
+        }
+      }
+      if (msg.type === 'ack' && msg.msgId) {
+        resolveAck(msg.msgId, {
+          status: msg.status ?? 'applied',
+          elementCount: msg.elementCount,
+          expectedCount: msg.expectedCount
+        });
+      }
+    } catch (err) {
+      logger.debug('Failed to parse WS message from client:', (err as Error).message);
+    }
+  });
+
   ws.on('close', () => {
-    clients.delete(ws);
+    unregisterConnection(ws);
     logger.info('WebSocket connection closed');
   });
-  
+
   ws.on('error', (error) => {
     logger.error('WebSocket error:', error);
-    clients.delete(ws);
+    unregisterConnection(ws);
   });
 });
 
@@ -223,7 +404,7 @@ app.get('/api/elements', (req: Request, res: Response) => {
 });
 
 // Create new element
-app.post('/api/elements', (req: Request, res: Response) => {
+app.post('/api/elements', async (req: Request, res: Response) => {
   try {
     const projId = resolveTenantProject(req);
     const params = CreateElementSchema.parse(req.body);
@@ -240,17 +421,26 @@ app.post('/api/elements', (req: Request, res: Response) => {
       version: 1
     };
 
-    store.setElement(id, element, projId);
-    
+    const sv = store.setElement(id, element, projId);
+
+    const scope = resolveScope(req);
     const message: ElementCreatedMessage = {
       type: 'element_created',
       element: element
     };
-    broadcast(message);
-    
+    (message as any).sync_version = sv;
+    const ackResult = await broadcastWithAck(scope.tenantId, scope.projectId, message);
+
     res.json({
       success: true,
-      element: element
+      element: element,
+      syncedToCanvas: ackResult.acked,
+      canvasStatus: {
+        connectedBrowsers: ackResult.delivered,
+        ackedBy: ackResult.acked ? 1 : 0,
+        reason: ackResult.reason,
+        scope: `${scope.tenantId}/${scope.projectId}`
+      }
     });
   } catch (error) {
     logger.error('Error creating element:', error);
@@ -262,7 +452,7 @@ app.post('/api/elements', (req: Request, res: Response) => {
 });
 
 // Update element
-app.put('/api/elements/:id', (req: Request, res: Response) => {
+app.put('/api/elements/:id', async (req: Request, res: Response) => {
   try {
     const projId = resolveTenantProject(req);
     const { id } = req.params;
@@ -292,17 +482,26 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       version: (existingElement.version || 0) + 1
     };
 
-    store.setElement(id, updatedElement, projId);
-    
+    const sv = store.setElement(id, updatedElement, projId);
+
+    const scope = resolveScope(req);
     const message: ElementUpdatedMessage = {
       type: 'element_updated',
       element: updatedElement
     };
-    broadcast(message);
-    
+    (message as any).sync_version = sv;
+    const ackResult = await broadcastWithAck(scope.tenantId, scope.projectId, message);
+
     res.json({
       success: true,
-      element: updatedElement
+      element: updatedElement,
+      syncedToCanvas: ackResult.acked,
+      canvasStatus: {
+        connectedBrowsers: ackResult.delivered,
+        ackedBy: ackResult.acked ? 1 : 0,
+        reason: ackResult.reason,
+        scope: `${scope.tenantId}/${scope.projectId}`
+      }
     });
   } catch (error) {
     logger.error('Error updating element:', error);
@@ -319,7 +518,8 @@ app.delete('/api/elements/clear', (req: Request, res: Response) => {
     const projId = resolveTenantProject(req);
     const count = store.clearElements(projId);
 
-    broadcast({
+    const scope = resolveScope(req);
+    broadcastToScope(scope.tenantId, scope.projectId, {
       type: 'canvas_cleared',
       timestamp: new Date().toISOString()
     });
@@ -361,13 +561,13 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
     }
     
     store.deleteElement(id, projId);
-    
-    // Broadcast to all connected clients
+
+    const scope = resolveScope(req);
     const message: ElementDeletedMessage = {
       type: 'element_deleted',
       elementId: id!
     };
-    broadcast(message);
+    broadcastToScope(scope.tenantId, scope.projectId, message);
     
     res.json({
       success: true,
@@ -579,7 +779,7 @@ function resolveArrowBindings(batchElements: ServerElement[], projectId?: string
 }
 
 // Batch create elements
-app.post('/api/elements/batch', (req: Request, res: Response) => {
+app.post('/api/elements/batch', async (req: Request, res: Response) => {
   try {
     const projId = resolveTenantProject(req);
     const { elements: elementsToCreate } = req.body;
@@ -611,19 +811,28 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
 
     resolveArrowBindings(createdElements, projId);
 
-    createdElements.forEach(el => store.setElement(el.id, el, projId));
+    let latestSyncVersion = 0;
+    createdElements.forEach(el => { latestSyncVersion = store.setElement(el.id, el, projId); });
 
-    // Broadcast to all connected clients
+    const scope = resolveScope(req);
     const message: BatchCreatedMessage = {
       type: 'elements_batch_created',
       elements: createdElements
     };
-    broadcast(message);
+    (message as any).sync_version = latestSyncVersion;
+    const ackResult = await broadcastWithAck(scope.tenantId, scope.projectId, message);
 
     res.json({
       success: true,
       elements: createdElements,
-      count: createdElements.length
+      count: createdElements.length,
+      syncedToCanvas: ackResult.acked,
+      canvasStatus: {
+        connectedBrowsers: ackResult.delivered,
+        ackedBy: ackResult.acked ? 1 : 0,
+        reason: ackResult.reason,
+        scope: `${scope.tenantId}/${scope.projectId}`
+      }
     });
   } catch (error) {
     logger.error('Error batch creating elements:', error);
@@ -651,8 +860,9 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
       hasConfig: !!config 
     });
     
-    // Broadcast to all WebSocket clients to process the Mermaid diagram
-    broadcast({
+    // Broadcast to scoped WebSocket clients to process the Mermaid diagram
+    const scope = resolveScope(req);
+    broadcastToScope(scope.tenantId, scope.projectId, {
       type: 'mermaid_convert',
       mermaidDiagram,
       config: config || {},
@@ -720,7 +930,8 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
     store.bulkReplaceElements(processedElements, projId);
     logger.info(`Sync completed: ${successCount}/${frontendElements.length} elements synced`);
 
-    broadcast({
+    const scope = resolveScope(req);
+    broadcastToScope(scope.tenantId, scope.projectId, {
       type: 'elements_synced',
       count: successCount,
       timestamp: new Date().toISOString(),
@@ -743,6 +954,76 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       error: (error as Error).message,
       details: 'Internal server error during sync operation'
     });
+  }
+});
+
+// ── Delta Sync v2 (Task 10) ──
+
+app.post('/api/elements/sync/v2', (req: Request, res: Response) => {
+  try {
+    const projId = resolveTenantProject(req);
+    const { lastSyncVersion = 0, changes = [] } = req.body;
+
+    if (typeof lastSyncVersion !== 'number') {
+      return res.status(400).json({ success: false, error: 'lastSyncVersion must be a number' });
+    }
+
+    const scope = resolveScope(req);
+    const feChangeIds = new Set<string>();
+
+    // Apply FE changes to DB
+    let appliedCount = 0;
+    for (const change of changes) {
+      const { id, action, element } = change;
+      if (!id || !action) continue;
+      feChangeIds.add(id);
+
+      if (action === 'delete') {
+        store.deleteElement(id, projId);
+        appliedCount++;
+      } else if (action === 'upsert' && element) {
+        store.setElement(id, element, projId);
+        appliedCount++;
+      }
+    }
+
+    // Get BE-side changes the FE hasn't seen (excluding what FE just sent)
+    const allBEChanges = getChangesSince(lastSyncVersion, projId);
+    const serverChanges = allBEChanges.filter(c => !feChangeIds.has(c.id));
+
+    const currentVersion = getCurrentSyncVersion(projId);
+
+    // Broadcast FE changes to other tabs in scope
+    if (appliedCount > 0) {
+      broadcastToScope(scope.tenantId, scope.projectId, {
+        type: 'elements_synced',
+        count: appliedCount,
+        timestamp: new Date().toISOString(),
+        source: 'delta_sync_v2',
+        sync_version: currentVersion
+      });
+    }
+
+    res.json({
+      success: true,
+      currentSyncVersion: currentVersion,
+      serverChanges,
+      appliedCount
+    });
+  } catch (error) {
+    logger.error('Delta sync v2 error:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Get current sync version for a project
+app.get('/api/sync/version', (req: Request, res: Response) => {
+  try {
+    const projId = resolveTenantProject(req);
+    const version = getCurrentSyncVersion(projId);
+    res.json({ success: true, syncVersion: version });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
   }
 });
 
@@ -829,7 +1110,7 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       });
     }
 
-    if (clients.size === 0) {
+    if (wsToConnection.size === 0) {
       return res.status(503).json({
         success: false,
         error: 'No frontend client connected. Open the canvas in a browser first.'
@@ -837,6 +1118,7 @@ app.post('/api/export/image', (req: Request, res: Response) => {
     }
 
     const requestId = generateId();
+    const scope = resolveScope(req);
 
     const exportPromise = new Promise<{ format: string; data: string }>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -847,7 +1129,7 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       pendingExports.set(requestId, { resolve, reject, timeout });
     });
 
-    broadcast({
+    broadcastToScope(scope.tenantId, scope.projectId, {
       type: 'export_image_request',
       requestId,
       format,
@@ -928,7 +1210,7 @@ app.post('/api/viewport', (req: Request, res: Response) => {
   try {
     const { scrollToContent, scrollToElementId, zoom, offsetX, offsetY } = req.body;
 
-    if (clients.size === 0) {
+    if (wsToConnection.size === 0) {
       return res.status(503).json({
         success: false,
         error: 'No frontend client connected. Open the canvas in a browser first.'
@@ -936,6 +1218,7 @@ app.post('/api/viewport', (req: Request, res: Response) => {
     }
 
     const requestId = generateId();
+    const scope = resolveScope(req);
 
     const viewportPromise = new Promise<{ success: boolean; message: string }>((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -946,7 +1229,7 @@ app.post('/api/viewport', (req: Request, res: Response) => {
       pendingViewports.set(requestId, { resolve, reject, timeout });
     });
 
-    broadcast({
+    broadcastToScope(scope.tenantId, scope.projectId, {
       type: 'set_viewport',
       requestId,
       scrollToContent,
@@ -1183,7 +1466,7 @@ app.get('/health', (req: Request, res: Response) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     elements_count: store.getElementCount(projId),
-    websocket_clients: clients.size
+    websocket_clients: wsToConnection.size
   });
 });
 
@@ -1198,7 +1481,7 @@ app.get('/api/sync/status', (req: Request, res: Response) => {
       heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024), // MB
       heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024), // MB
     },
-    websocketClients: clients.size
+    websocketClients: wsToConnection.size
   });
 });
 
@@ -1267,7 +1550,7 @@ export function stopCanvasServer(): Promise<void> {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
-    clients.forEach(c => c.close());
+    for (const conn of wsToConnection.values()) conn.ws.close();
     httpServer.close(() => resolve());
   });
 }

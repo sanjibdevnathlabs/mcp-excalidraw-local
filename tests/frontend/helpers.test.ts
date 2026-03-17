@@ -3,6 +3,10 @@ import {
   cleanElementForExcalidraw,
   validateAndFixBindings,
   computeElementHash,
+  isImageElement,
+  isShapeContainerType,
+  normalizeImageElement,
+  restoreBindings,
 } from '../../frontend/src/utils/elementHelpers.js';
 import type { ServerElement } from '../../frontend/src/utils/elementHelpers.js';
 
@@ -214,5 +218,161 @@ describe('computeElementHash', () => {
   it('includes element count in hash', () => {
     const hash = computeElementHash([{ id: 'x', version: 1 }]);
     expect(hash.startsWith('1')).toBe(true);
+  });
+});
+
+// ─── isImageElement ─────────────────────────────────────────
+
+describe('isImageElement', () => {
+  it('returns true for image type', () => {
+    expect(isImageElement({ type: 'image' } as any)).toBe(true);
+  });
+
+  it('returns false for non-image types', () => {
+    expect(isImageElement({ type: 'rectangle' } as any)).toBe(false);
+    expect(isImageElement({ type: 'text' } as any)).toBe(false);
+    expect(isImageElement({ type: 'arrow' } as any)).toBe(false);
+  });
+});
+
+// ─── isShapeContainerType ───────────────────────────────────
+
+describe('isShapeContainerType', () => {
+  it('returns true for container types', () => {
+    expect(isShapeContainerType('rectangle')).toBe(true);
+    expect(isShapeContainerType('ellipse')).toBe(true);
+    expect(isShapeContainerType('diamond')).toBe(true);
+    expect(isShapeContainerType('arrow')).toBe(true);
+    expect(isShapeContainerType('line')).toBe(true);
+  });
+
+  it('returns false for non-container types', () => {
+    expect(isShapeContainerType('text')).toBe(false);
+    expect(isShapeContainerType('image')).toBe(false);
+    expect(isShapeContainerType('freedraw')).toBe(false);
+  });
+});
+
+// ─── normalizeImageElement ──────────────────────────────────
+
+describe('normalizeImageElement', () => {
+  it('fills in default values for missing properties', () => {
+    const el = { id: 'img1', type: 'image', x: 0, y: 0, width: 100, height: 100 };
+    const result = normalizeImageElement(el);
+
+    expect(result.status).toBe('saved');
+    expect(result.fileId).toBeNull();
+    expect(result.scale).toEqual([1, 1]);
+    expect(result.angle).toBe(0);
+    expect(result.roughness).toBe(1);
+    expect(result.opacity).toBe(100);
+    expect(result.isDeleted).toBe(false);
+    expect(result.locked).toBe(false);
+  });
+
+  it('preserves existing values', () => {
+    const el = {
+      id: 'img2',
+      type: 'image',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      status: 'pending',
+      fileId: 'abc',
+      scale: [2, 2] as [number, number],
+      opacity: 50,
+    };
+    const result = normalizeImageElement(el);
+
+    expect(result.status).toBe('pending');
+    expect(result.fileId).toBe('abc');
+    expect(result.scale).toEqual([2, 2]);
+    expect(result.opacity).toBe(50);
+  });
+});
+
+// ─── restoreBindings ────────────────────────────────────────
+
+describe('restoreBindings', () => {
+  it('restores startBinding and endBinding from originals', () => {
+    const converted = [
+      { id: 'arrow1', type: 'arrow', x: 0, y: 0 },
+    ];
+    const originals = [
+      {
+        id: 'arrow1',
+        type: 'arrow',
+        x: 0,
+        y: 0,
+        startBinding: { elementId: 'rect1', focus: 0, gap: 5 },
+        endBinding: { elementId: 'rect2', focus: 0, gap: 5 },
+      },
+    ];
+
+    const result = restoreBindings(converted, originals);
+    expect(result[0].startBinding).toEqual({ elementId: 'rect1', focus: 0, gap: 5 });
+    expect(result[0].endBinding).toEqual({ elementId: 'rect2', focus: 0, gap: 5 });
+  });
+
+  it('restores boundElements from originals', () => {
+    const converted = [
+      { id: 'rect1', type: 'rectangle', x: 0, y: 0 },
+    ];
+    const originals = [
+      {
+        id: 'rect1',
+        type: 'rectangle',
+        x: 0,
+        y: 0,
+        boundElements: [{ id: 'arrow1', type: 'arrow' }],
+      },
+    ];
+
+    const result = restoreBindings(converted, originals);
+    expect(result[0].boundElements).toEqual([{ id: 'arrow1', type: 'arrow' }]);
+  });
+
+  it('restores elbowed property from originals', () => {
+    const converted = [
+      { id: 'arrow1', type: 'arrow', x: 0, y: 0 },
+    ];
+    const originals = [
+      { id: 'arrow1', type: 'arrow', x: 0, y: 0, elbowed: true },
+    ];
+
+    const result = restoreBindings(converted, originals);
+    expect(result[0].elbowed).toBe(true);
+  });
+
+  it('does not overwrite existing bindings', () => {
+    const existingBinding = { elementId: 'rect99', focus: 1, gap: 10 };
+    const converted = [
+      { id: 'arrow1', type: 'arrow', x: 0, y: 0, startBinding: existingBinding },
+    ];
+    const originals = [
+      {
+        id: 'arrow1',
+        type: 'arrow',
+        x: 0,
+        y: 0,
+        startBinding: { elementId: 'rect1', focus: 0, gap: 5 },
+      },
+    ];
+
+    const result = restoreBindings(converted, originals);
+    expect(result[0].startBinding).toEqual(existingBinding);
+  });
+
+  it('handles elements not found in originals', () => {
+    const converted = [
+      { id: 'new1', type: 'rectangle', x: 0, y: 0 },
+    ];
+    const originals = [
+      { id: 'other', type: 'rectangle', x: 0, y: 0, boundElements: [{ id: 'a', type: 'arrow' }] },
+    ];
+
+    const result = restoreBindings(converted, originals);
+    expect(result[0]).toEqual({ id: 'new1', type: 'rectangle', x: 0, y: 0 });
   });
 });

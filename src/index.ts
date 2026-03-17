@@ -122,9 +122,18 @@ interface ApiResponse {
   count?: number;
 }
 
+interface CanvasStatus {
+  connectedBrowsers: number;
+  ackedBy: number;
+  reason?: string;
+  scope: string;
+}
+
 interface SyncResponse {
   element?: ServerElement;
   elements?: ServerElement[];
+  syncedToCanvas?: boolean;
+  canvasStatus?: CanvasStatus;
 }
 
 function canvasHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -206,27 +215,27 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
 }
 
 // Helper to sync element creation to canvas
-async function createElementOnCanvas(elementData: ServerElement): Promise<ServerElement | null> {
+async function createElementOnCanvas(elementData: ServerElement): Promise<SyncResponse | null> {
   const result = await syncToCanvas('create', elementData);
-  return result?.element || elementData;
+  return result ?? null;
 }
 
-// Helper to sync element update to canvas  
-async function updateElementOnCanvas(elementData: Partial<ServerElement> & { id: string }): Promise<ServerElement | null> {
+// Helper to sync element update to canvas
+async function updateElementOnCanvas(elementData: Partial<ServerElement> & { id: string }): Promise<SyncResponse | null> {
   const result = await syncToCanvas('update', elementData);
-  return result?.element || null;
+  return result ?? null;
 }
 
 // Helper to sync element deletion to canvas
 async function deleteElementOnCanvas(elementId: string): Promise<any> {
   const result = await syncToCanvas('delete', { id: elementId });
-  return result;
+  return result ?? null;
 }
 
 // Helper to sync batch creation to canvas
-async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promise<ServerElement[] | null> {
+async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promise<SyncResponse | null> {
   const result = await syncToCanvas('batch_create', elementsData);
-  return result?.elements || elementsData;
+  return result ?? null;
 }
 
 // Helper to fetch element from canvas
@@ -1052,22 +1061,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const excalidrawElement = convertTextToLabel(element);
 
         // Create element directly on HTTP server (no local storage)
-        const canvasElement = await createElementOnCanvas(excalidrawElement);
-        
-        if (!canvasElement) {
+        const canvasResponse = await createElementOnCanvas(excalidrawElement);
+
+        if (!canvasResponse) {
           throw new Error('Failed to create element: HTTP server unavailable');
         }
-        
-        logger.info('Element created via MCP and synced to canvas', { 
-          id: excalidrawElement.id, 
+
+        const synced = canvasResponse.syncedToCanvas ?? false;
+        logger.info('Element created via MCP', {
+          id: excalidrawElement.id,
           type: excalidrawElement.type,
-          synced: !!canvasElement 
+          synced,
+          canvasStatus: canvasResponse.canvasStatus
         });
-        
+
+        const statusEmoji = synced ? '✅' : '⚠️';
+        const statusText = synced
+          ? 'Synced to canvas and confirmed by browser'
+          : `Canvas sync not confirmed (${canvasResponse.canvasStatus?.reason ?? 'unknown'})`;
+
         return {
-          content: [{ 
-            type: 'text', 
-            text: `Element created successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas` 
+          content: [{
+            type: 'text',
+            text: `Element created successfully!\n\n${JSON.stringify(canvasResponse.element ?? excalidrawElement, null, 2)}\n\n${statusEmoji} ${statusText}`
           }]
         };
       }
@@ -1091,21 +1107,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const excalidrawElement = convertTextToLabel(updatePayload as ServerElement);
         
         // Update element directly on HTTP server (no local storage)
-        const canvasElement = await updateElementOnCanvas(excalidrawElement);
-        
-        if (!canvasElement) {
+        const canvasResponse = await updateElementOnCanvas(excalidrawElement);
+
+        if (!canvasResponse) {
           throw new Error('Failed to update element: HTTP server unavailable or element not found');
         }
-        
-        logger.info('Element updated via MCP and synced to canvas', { 
-          id: excalidrawElement.id, 
-          synced: !!canvasElement 
+
+        const synced = canvasResponse.syncedToCanvas ?? false;
+        logger.info('Element updated via MCP', {
+          id: excalidrawElement.id,
+          synced,
+          canvasStatus: canvasResponse.canvasStatus
         });
-        
+
         return {
-          content: [{ 
+          content: [{
             type: 'text', 
-            text: `Element updated successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas` 
+            text: `Element updated successfully!\n\n${JSON.stringify(canvasResponse.element ?? excalidrawElement, null, 2)}\n\n${synced ? '✅ Synced to canvas and confirmed' : `⚠️ Canvas sync not confirmed (${canvasResponse.canvasStatus?.reason ?? 'unknown'})`}` 
           }]
         };
       }
@@ -1549,28 +1567,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           createdElements.push(excalidrawElement);
         }
 
-        const canvasElements = await batchCreateElementsOnCanvas(createdElements);
+        const canvasResponse = await batchCreateElementsOnCanvas(createdElements);
 
-        if (!canvasElements) {
+        if (!canvasResponse) {
           throw new Error('Failed to batch create elements: HTTP server unavailable');
         }
 
         const result = {
           success: true,
-          elements: canvasElements,
-          count: canvasElements.length,
-          syncedToCanvas: true
+          elements: canvasResponse.elements ?? createdElements,
+          count: (canvasResponse.elements ?? createdElements).length,
+          syncedToCanvas: canvasResponse.syncedToCanvas ?? false,
+          canvasStatus: canvasResponse.canvasStatus
         };
 
-        logger.info('Batch elements created via MCP and synced to canvas', {
+        logger.info('Batch elements created via MCP', {
           count: result.count,
-          synced: result.syncedToCanvas
+          synced: result.syncedToCanvas,
+          canvasStatus: result.canvasStatus
         });
+
+        const statusEmoji = result.syncedToCanvas ? '✅' : '⚠️';
+        const statusText = result.syncedToCanvas
+          ? 'All elements synced to canvas and confirmed by browser'
+          : `Canvas sync not confirmed (${result.canvasStatus?.reason ?? 'unknown'})`;
 
         return {
           content: [{
             type: 'text',
-            text: `${result.count} elements created successfully!\n\n${JSON.stringify(result, null, 2)}\n\n${result.syncedToCanvas ? '✅ All elements synced to canvas' : '⚠️  Canvas sync failed (elements still created locally)'}`
+            text: `${result.count} elements created successfully!\n\n${JSON.stringify(result, null, 2)}\n\n${statusEmoji} ${statusText}`
           }]
         };
       }
@@ -2695,12 +2720,31 @@ async function runServer(): Promise<void> {
           const { tenantId: newTid } = applyTenant(workspacePath);
 
           try {
-            await fetch(`${EXPRESS_SERVER_URL}/api/tenant/active`, {
+            const putRes = await fetch(`${EXPRESS_SERVER_URL}/api/tenant/active`, {
               method: 'PUT',
               headers: canvasHeaders(),
               body: JSON.stringify({ tenantId: newTid })
             });
-          } catch {}
+            if (!putRes.ok) {
+              logger.error(`Failed to set tenant on canvas server: HTTP ${putRes.status}`);
+            }
+
+            // Verify the canvas server accepted the tenant switch
+            const verifyRes = await fetch(`${EXPRESS_SERVER_URL}/api/tenant/active`, {
+              headers: canvasHeaders()
+            });
+            if (verifyRes.ok) {
+              const verifyData = await verifyRes.json() as { tenant?: { id?: string } };
+              if (verifyData.tenant?.id !== newTid) {
+                logger.error(
+                  `Canvas server has stale tenant: expected "${newTid}", got "${verifyData.tenant?.id}". ` +
+                  `Restart the canvas server or kill the process on port ${process.env['CANVAS_PORT'] || 3000}.`
+                );
+              }
+            }
+          } catch (tenantErr) {
+            logger.error('Failed to update tenant on canvas server:', (tenantErr as Error).message);
+          }
         }
       }
     } catch (rootsErr) {

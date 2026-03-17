@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
-import { initDb, closeDb, setElement, getAllElements, setSetting, getSetting } from '../../src/db.js';
+import { initDb, closeDb, setElement, getAllElements, setSetting, getSetting, getCurrentSyncVersion, setActiveTenant } from '../../src/db.js';
 import type { ServerElement } from '../../src/types.js';
 import path from 'path';
 import os from 'os';
@@ -27,6 +27,8 @@ function makeElement(overrides: Partial<ServerElement> = {}): ServerElement {
 beforeEach(async () => {
   dbPath = path.join(os.tmpdir(), `excalidraw-api-test-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
   initDb(dbPath);
+  // Reset module-level active tenant/project to 'default' (may be stale from previous test)
+  setActiveTenant('default');
   const mod = await import('../../src/server.js');
   app = mod.default;
 });
@@ -428,5 +430,160 @@ describe('Tenant-scoped requests via X-Tenant-Id', () => {
       .set('X-Tenant-Id', 'tenant-b');
     expect(resB.body.count).toBe(1);
     expect(resB.body.elements[0].type).toBe('ellipse');
+  });
+});
+
+// ─── Sync Version ───────────────────────────────────────────
+
+describe('GET /api/sync/version', () => {
+  it('returns syncVersion 0 initially', async () => {
+    const res = await request(app).get('/api/sync/version');
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.syncVersion).toBe(0);
+  });
+
+  it('syncVersion increases after element creation', async () => {
+    await request(app)
+      .post('/api/elements')
+      .send({ type: 'rectangle', x: 0, y: 0, width: 50, height: 50 });
+
+    const res = await request(app).get('/api/sync/version');
+    expect(res.status).toBe(200);
+    expect(res.body.syncVersion).toBeGreaterThan(0);
+  });
+});
+
+// ─── Delta Sync v2 ──────────────────────────────────────────
+
+describe('POST /api/elements/sync/v2', () => {
+  it('returns currentSyncVersion and empty serverChanges', async () => {
+    const res = await request(app)
+      .post('/api/elements/sync/v2')
+      .send({ lastSyncVersion: 0, changes: [] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body).toHaveProperty('currentSyncVersion');
+    expect(typeof res.body.currentSyncVersion).toBe('number');
+    expect(Array.isArray(res.body.serverChanges)).toBe(true);
+    expect(res.body.serverChanges.length).toBe(0);
+  });
+
+  it('applies upsert changes', async () => {
+    const res = await request(app)
+      .post('/api/elements/sync/v2')
+      .send({
+        lastSyncVersion: 0,
+        changes: [
+          {
+            id: 'sv2-1',
+            action: 'upsert',
+            element: { id: 'sv2-1', type: 'rectangle', x: 0, y: 0, width: 50, height: 50 },
+          },
+        ],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.appliedCount).toBe(1);
+
+    const getRes = await request(app).get('/api/elements/sv2-1');
+    expect(getRes.status).toBe(200);
+    expect(getRes.body.element.id).toBe('sv2-1');
+  });
+
+  it('applies delete changes', async () => {
+    setElement('sv2-del', makeElement({ id: 'sv2-del' }));
+
+    const res = await request(app)
+      .post('/api/elements/sync/v2')
+      .send({
+        lastSyncVersion: 0,
+        changes: [{ id: 'sv2-del', action: 'delete' }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.appliedCount).toBe(1);
+
+    const getRes = await request(app).get('/api/elements/sv2-del');
+    expect(getRes.status).toBe(404);
+  });
+
+  it('returns server changes since lastSyncVersion', async () => {
+    setElement('sv1', makeElement({ id: 'sv1' }));
+    setElement('sv2', makeElement({ id: 'sv2' }));
+
+    const res = await request(app)
+      .post('/api/elements/sync/v2')
+      .send({ lastSyncVersion: 0, changes: [] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.serverChanges.length).toBeGreaterThanOrEqual(2);
+    const ids = res.body.serverChanges.map((c: any) => c.id);
+    expect(ids).toContain('sv1');
+    expect(ids).toContain('sv2');
+  });
+
+  it('rejects non-number lastSyncVersion', async () => {
+    const res = await request(app)
+      .post('/api/elements/sync/v2')
+      .send({ lastSyncVersion: 'bad', changes: [] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+  });
+});
+
+// ─── canvasStatus in mutation responses ─────────────────────
+
+describe('canvasStatus in mutation responses', () => {
+  it('POST /api/elements includes syncedToCanvas and canvasStatus', async () => {
+    const res = await request(app)
+      .post('/api/elements')
+      .send({ type: 'rectangle', x: 0, y: 0, width: 100, height: 50 });
+
+    expect(res.status).toBe(200);
+    expect(typeof res.body.syncedToCanvas).toBe('boolean');
+    expect(res.body.syncedToCanvas).toBe(false);
+    expect(res.body.canvasStatus).toBeDefined();
+    expect(res.body.canvasStatus).toHaveProperty('connectedBrowsers');
+    expect(res.body.canvasStatus).toHaveProperty('ackedBy');
+    expect(res.body.canvasStatus).toHaveProperty('reason');
+    expect(res.body.canvasStatus).toHaveProperty('scope');
+  });
+
+  it('PUT /api/elements/:id includes canvasStatus', async () => {
+    setElement('cs-put', makeElement({ id: 'cs-put', x: 0 }));
+
+    const res = await request(app)
+      .put('/api/elements/cs-put')
+      .send({ x: 100 });
+
+    expect(res.status).toBe(200);
+    expect(typeof res.body.syncedToCanvas).toBe('boolean');
+    expect(res.body.canvasStatus).toBeDefined();
+    expect(res.body.canvasStatus).toHaveProperty('connectedBrowsers');
+    expect(res.body.canvasStatus).toHaveProperty('ackedBy');
+    expect(res.body.canvasStatus).toHaveProperty('reason');
+    expect(res.body.canvasStatus).toHaveProperty('scope');
+  });
+
+  it('POST /api/elements/batch includes canvasStatus', async () => {
+    const res = await request(app)
+      .post('/api/elements/batch')
+      .send({
+        elements: [
+          { type: 'rectangle', x: 0, y: 0, width: 50, height: 50 },
+          { type: 'ellipse', x: 100, y: 100, width: 40, height: 40 },
+        ],
+      });
+
+    expect(res.status).toBe(200);
+    expect(typeof res.body.syncedToCanvas).toBe('boolean');
+    expect(res.body.canvasStatus).toBeDefined();
+    expect(res.body.canvasStatus).toHaveProperty('connectedBrowsers');
+    expect(res.body.canvasStatus).toHaveProperty('ackedBy');
+    expect(res.body.canvasStatus).toHaveProperty('reason');
+    expect(res.body.canvasStatus).toHaveProperty('scope');
   });
 });

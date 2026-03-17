@@ -68,6 +68,12 @@ function App(): JSX.Element {
   const isSyncingRef = useRef<boolean>(false)
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastSyncedHashRef = useRef<string>('')
+  const lastSyncVersionRef = useRef<number>(
+    parseInt(localStorage.getItem('excalidraw-last-sync-version') ?? '0', 10)
+  )
+  const lastSyncedElementsRef = useRef<Map<string, ServerElement>>(new Map())
+  const lastReceivedSyncVersionRef = useRef<number>(0)
+  const isResyncingRef = useRef<boolean>(false)
 
   const DEBOUNCE_MS = 3000
 
@@ -254,9 +260,77 @@ function App(): JSX.Element {
     }
   }
 
+  const sendAck = (msgId: string | undefined, status: 'applied' | 'partial' | 'failed', elementCount?: number, expectedCount?: number): void => {
+    if (!msgId) return
+    const ws = websocketRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ type: 'ack', msgId, status, elementCount, expectedCount }))
+  }
+
+  const triggerDeltaResync = async (): Promise<void> => {
+    if (isResyncingRef.current) return
+    isResyncingRef.current = true
+    try {
+      const response = await fetch('/api/elements/sync/v2', {
+        method: 'POST',
+        headers: tenantHeaders(),
+        body: JSON.stringify({
+          lastSyncVersion: lastReceivedSyncVersionRef.current,
+          changes: []
+        })
+      })
+      if (response.ok) {
+        const data = await response.json() as {
+          currentSyncVersion: number
+          serverChanges: { id: string; action: string; element: any; sync_version: number }[]
+        }
+        const api = excalidrawAPIRef.current
+        if (api && data.serverChanges.length > 0) {
+          const scene = api.getSceneElements()
+          let merged = [...scene]
+          for (const sc of data.serverChanges) {
+            if (sc.action === 'delete') {
+              merged = merged.filter(el => el.id !== sc.id)
+            } else if (sc.element) {
+              const cleaned = cleanElementForExcalidraw(sc.element)
+              const converted = convertToExcalidrawElements([cleaned], { regenerateIds: false })
+              const idx = merged.findIndex(el => el.id === sc.id)
+              if (idx >= 0) {
+                merged[idx] = converted[0]!
+              } else {
+                merged.push(...converted)
+              }
+            }
+          }
+          api.updateScene({ elements: merged, captureUpdate: CaptureUpdateAction.NEVER })
+        }
+        lastReceivedSyncVersionRef.current = data.currentSyncVersion
+        lastSyncVersionRef.current = data.currentSyncVersion
+        localStorage.setItem('excalidraw-last-sync-version', String(data.currentSyncVersion))
+        console.log(`Delta resync complete: received ${data.serverChanges.length} changes, now at v${data.currentSyncVersion}`)
+      }
+    } catch (err) {
+      console.error('Delta resync failed:', err)
+    } finally {
+      isResyncingRef.current = false
+    }
+  }
+
   const handleWebSocketMessage = async (data: WebSocketMessage): Promise<void> => {
+    // Gap detection (Task 12): if a message carries sync_version, check for gaps
+    if (data.sync_version !== undefined && typeof data.sync_version === 'number') {
+      const expected = lastReceivedSyncVersionRef.current + 1
+      if (data.sync_version > expected && lastReceivedSyncVersionRef.current > 0) {
+        console.warn(`Sync gap: expected v${expected}, got v${data.sync_version}. Triggering resync.`)
+        triggerDeltaResync()
+        return // resync will fetch everything including this message's changes
+      }
+      lastReceivedSyncVersionRef.current = data.sync_version
+    }
+
     const api = excalidrawAPIRef.current
     if (!api) {
+      sendAck(data.msgId, 'failed')
       return
     }
 
@@ -295,6 +369,9 @@ function App(): JSX.Element {
                 captureUpdate: CaptureUpdateAction.NEVER
               })
             }
+            const scene = api.getSceneElements()
+            const landed = scene.some(s => s.id === data.element!.id)
+            sendAck(data.msgId, landed ? 'applied' : 'failed', landed ? 1 : 0, 1)
           }
           break
           
@@ -309,6 +386,7 @@ function App(): JSX.Element {
               elements: updatedElements,
               captureUpdate: CaptureUpdateAction.NEVER
             })
+            sendAck(data.msgId, 'applied', 1, 1)
           }
           break
 
@@ -319,6 +397,7 @@ function App(): JSX.Element {
               elements: filteredElements,
               captureUpdate: CaptureUpdateAction.NEVER
             })
+            sendAck(data.msgId, 'applied', 1, 1)
           }
           break
 
@@ -341,6 +420,12 @@ function App(): JSX.Element {
                 captureUpdate: CaptureUpdateAction.NEVER
               })
             }
+            // Verify elements landed in the scene
+            const scene = api.getSceneElements()
+            const expectedIds = data.elements.map((e: ServerElement) => e.id)
+            const landedCount = expectedIds.filter(id => scene.some(s => s.id === id)).length
+            const status = landedCount === expectedIds.length ? 'applied' : landedCount > 0 ? 'partial' : 'failed'
+            sendAck(data.msgId, status, landedCount, expectedIds.length)
           }
           break
           
@@ -358,6 +443,7 @@ function App(): JSX.Element {
             elements: [],
             captureUpdate: CaptureUpdateAction.NEVER
           })
+          sendAck(data.msgId, 'applied')
           break
 
         case 'export_image_request':
@@ -732,21 +818,71 @@ function App(): JSX.Element {
       const activeElements = currentElements.filter(el => !el.isDeleted)
       const backendElements = normalizeForBackend(activeElements)
 
-      const response = await fetch('/api/elements/sync', {
+      // Compute delta: what changed since last sync
+      const changes: { id: string; action: string; element?: any }[] = []
+      const currentMap = new Map<string, any>()
+      for (const el of backendElements) {
+        currentMap.set(el.id, el)
+        const prev = lastSyncedElementsRef.current.get(el.id)
+        if (!prev || JSON.stringify(prev) !== JSON.stringify(el)) {
+          changes.push({ id: el.id, action: 'upsert', element: el })
+        }
+      }
+      // Detect deletions: elements in last sync but not current
+      for (const [id] of lastSyncedElementsRef.current) {
+        if (!currentMap.has(id)) {
+          changes.push({ id, action: 'delete' })
+        }
+      }
+
+      const response = await fetch('/api/elements/sync/v2', {
         method: 'POST',
         headers: tenantHeaders(),
         body: JSON.stringify({
-          elements: backendElements,
-          timestamp: new Date().toISOString()
+          lastSyncVersion: lastSyncVersionRef.current,
+          changes
         })
       })
 
       if (response.ok) {
-        const result: ApiResponse = await response.json()
+        const result = await response.json() as {
+          currentSyncVersion: number
+          serverChanges: { id: string; action: string; element: any; sync_version: number }[]
+          appliedCount: number
+        }
+
+        // Apply server-side changes (MCP-created elements, other tabs' changes)
+        if (result.serverChanges.length > 0) {
+          const api = excalidrawAPIRef.current
+          if (api) {
+            const scene = api.getSceneElements()
+            let merged = [...scene]
+            for (const sc of result.serverChanges) {
+              if (sc.action === 'delete') {
+                merged = merged.filter(el => el.id !== sc.id)
+              } else if (sc.element) {
+                const cleaned = cleanElementForExcalidraw(sc.element)
+                const converted = convertToExcalidrawElements([cleaned], { regenerateIds: false })
+                const idx = merged.findIndex(el => el.id === sc.id)
+                if (idx >= 0) {
+                  merged[idx] = converted[0]!
+                } else {
+                  merged.push(...converted)
+                }
+              }
+            }
+            api.updateScene({ elements: merged, captureUpdate: CaptureUpdateAction.NEVER })
+          }
+        }
+
+        // Update tracking state
+        lastSyncVersionRef.current = result.currentSyncVersion
+        localStorage.setItem('excalidraw-last-sync-version', String(result.currentSyncVersion))
+        lastSyncedElementsRef.current = currentMap
         lastSyncedHashRef.current = computeElementHash(currentElements)
         setSyncStatus('idle')
         showToast('Saved')
-        console.log(`Sync: ${result.count} elements synced`)
+        console.log(`Delta sync: ${result.appliedCount} applied, ${result.serverChanges.length} received from server`)
       } else {
         setSyncStatus('idle')
         showToast('Sync failed', 3000)

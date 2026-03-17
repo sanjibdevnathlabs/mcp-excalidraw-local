@@ -30,6 +30,9 @@ import {
   bulkReplaceElements,
   getSetting,
   setSetting,
+  incrementSyncVersion,
+  getCurrentSyncVersion,
+  getChangesSince,
 } from '../../src/db.js';
 import type { ServerElement } from '../../src/types.js';
 import path from 'path';
@@ -422,5 +425,96 @@ describe('bulkReplaceElements', () => {
     setElement('x', makeElement({ id: 'x' }));
     bulkReplaceElements([]);
     expect(getAllElements()).toEqual([]);
+  });
+});
+
+// ─── Sync Version ───────────────────────────────────────────
+
+describe('Sync Version', () => {
+  it('getCurrentSyncVersion returns 0 initially', () => {
+    expect(getCurrentSyncVersion()).toBe(0);
+  });
+
+  it('incrementSyncVersion increments and returns new version', () => {
+    expect(incrementSyncVersion()).toBe(1);
+    expect(incrementSyncVersion()).toBe(2);
+    expect(incrementSyncVersion()).toBe(3);
+  });
+
+  it('setElement increments sync_version', () => {
+    setElement('sv1', makeElement({ id: 'sv1' }));
+    expect(getCurrentSyncVersion()).toBeGreaterThan(0);
+  });
+
+  it('setElement returns sync_version', () => {
+    const sv = setElement('sv2', makeElement({ id: 'sv2' }));
+    expect(sv).toBeGreaterThan(0);
+  });
+
+  it('deleteElement increments sync_version', () => {
+    setElement('del-sv', makeElement({ id: 'del-sv' }));
+    const versionAfterCreate = getCurrentSyncVersion();
+    deleteElement('del-sv');
+    expect(getCurrentSyncVersion()).toBeGreaterThan(versionAfterCreate);
+  });
+
+  it('clearElements increments sync_version', () => {
+    setElement('clr1', makeElement({ id: 'clr1' }));
+    setElement('clr2', makeElement({ id: 'clr2' }));
+    const versionAfterCreates = getCurrentSyncVersion();
+    clearElements();
+    expect(getCurrentSyncVersion()).toBeGreaterThan(versionAfterCreates);
+  });
+
+  it('getChangesSince returns empty for version 0 when no elements', () => {
+    const changes = getChangesSince(0);
+    expect(changes).toEqual([]);
+  });
+
+  it('getChangesSince returns upserts after setElement', () => {
+    setElement('cs1', makeElement({ id: 'cs1' }));
+    setElement('cs2', makeElement({ id: 'cs2' }));
+
+    const changes = getChangesSince(0);
+    expect(changes.length).toBe(2);
+    expect(changes.every(c => c.action === 'upsert')).toBe(true);
+  });
+
+  it('getChangesSince returns delete entries', () => {
+    setElement('csd1', makeElement({ id: 'csd1' }));
+    deleteElement('csd1');
+
+    const changes = getChangesSince(0);
+    const deleteChange = changes.find(c => c.action === 'delete');
+    expect(deleteChange).toBeDefined();
+  });
+
+  it('getChangesSince filters by version', () => {
+    const sv1 = setElement('fv1', makeElement({ id: 'fv1' }));
+    setElement('fv2', makeElement({ id: 'fv2' }));
+
+    const changes = getChangesSince(sv1);
+    expect(changes.length).toBe(1);
+    expect(changes[0]!.id).toBe('fv2');
+  });
+
+  it('sync_version is scoped per project', () => {
+    const proj1 = createProject('SV-P1');
+    const proj2 = createProject('SV-P2');
+
+    setActiveProject(proj1.id);
+    setElement('sp1', makeElement({ id: 'sp1' }));
+    const sv1 = getCurrentSyncVersion(proj1.id);
+
+    setActiveProject(proj2.id);
+    setElement('sp2', makeElement({ id: 'sp2' }));
+    setElement('sp3', makeElement({ id: 'sp3' }));
+    const sv2 = getCurrentSyncVersion(proj2.id);
+
+    // Each project tracks its own sync_version independently
+    expect(sv1).toBeGreaterThan(0);
+    expect(sv2).toBeGreaterThan(0);
+    // P2 had more mutations so its version should be higher than P1's
+    expect(sv2).toBeGreaterThan(sv1);
   });
 });
