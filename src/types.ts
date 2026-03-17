@@ -193,7 +193,46 @@ export type WebSocketMessageType =
   | 'set_viewport'
   | 'tenant_switched'
   | 'files_added'
-  | 'file_deleted';
+  | 'file_deleted'
+  | 'hello'
+  | 'hello_ack'
+  | 'ack';
+
+// Connection registry types
+export interface ClientConnection {
+  ws: import('ws').WebSocket;
+  tenantId: string;
+  projectId: string;
+  connectedAt: number;
+  identified: boolean;  // true after hello handshake
+}
+
+export interface BroadcastResult {
+  delivered: number;
+  msgId: string;
+  reason?: string;
+}
+
+export interface HelloMessage extends WebSocketMessage {
+  type: 'hello';
+  tenantId: string;
+  projectId: string;
+}
+
+export interface HelloAckMessage extends WebSocketMessage {
+  type: 'hello_ack';
+  tenantId: string;
+  projectId: string;
+  elements: ServerElement[];
+}
+
+export interface AckMessage extends WebSocketMessage {
+  type: 'ack';
+  msgId: string;
+  status: 'applied' | 'partial' | 'failed';
+  elementCount?: number;
+  expectedCount?: number;
+}
 
 export interface InitialElementsMessage extends WebSocketMessage {
   type: 'initial_elements';

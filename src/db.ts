@@ -168,6 +168,21 @@ function runMigrations(): void {
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_projects_tenant ON projects(tenant_id)`);
 
+  // Migration: add sync_version to elements table
+  const elementCols = db.prepare("PRAGMA table_info(elements)").all() as { name: string }[];
+  if (!elementCols.some(c => c.name === 'sync_version')) {
+    db.exec(`ALTER TABLE elements ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 0`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_elements_sync_version ON elements(project_id, sync_version)`);
+    logger.info('Migrated: added sync_version column to elements');
+  }
+
+  // Migration: add sync_version counter to projects table
+  const projectCols = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
+  if (!projectCols.some(c => c.name === 'sync_version')) {
+    db.exec(`ALTER TABLE projects ADD COLUMN sync_version INTEGER NOT NULL DEFAULT 0`);
+    logger.info('Migrated: added sync_version counter to projects');
+  }
+
   // Migration: assign orphan projects (no tenant_id) to default tenant
   const orphans = db.prepare('SELECT id FROM projects WHERE tenant_id IS NULL').all() as { id: string }[];
   if (orphans.length > 0) {
@@ -193,6 +208,44 @@ function extractLabelText(element: ServerElement): string | null {
 // Resolve effective project ID: explicit override > in-memory active
 function pid(override?: string): string {
   return override ?? activeProjectId;
+}
+
+// ── Sync Version ──
+
+export function incrementSyncVersion(projectId?: string): number {
+  const p = pid(projectId);
+  db.prepare('UPDATE projects SET sync_version = sync_version + 1 WHERE id = ?').run(p);
+  const row = db.prepare('SELECT sync_version FROM projects WHERE id = ?').get(p) as { sync_version: number } | undefined;
+  return row?.sync_version ?? 0;
+}
+
+export function getCurrentSyncVersion(projectId?: string): number {
+  const p = pid(projectId);
+  const row = db.prepare('SELECT sync_version FROM projects WHERE id = ?').get(p) as { sync_version: number } | undefined;
+  return row?.sync_version ?? 0;
+}
+
+export interface ElementChange {
+  id: string;
+  action: 'upsert' | 'delete';
+  element: ServerElement;
+  sync_version: number;
+}
+
+export function getChangesSince(sinceVersion: number, projectId?: string): ElementChange[] {
+  const p = pid(projectId);
+  const rows = db.prepare(`
+    SELECT id, data, sync_version, is_deleted FROM elements
+    WHERE project_id = ? AND sync_version > ?
+    ORDER BY sync_version ASC
+  `).all(p, sinceVersion) as { id: string; data: string; sync_version: number; is_deleted: number }[];
+
+  return rows.map(r => ({
+    id: r.id,
+    action: r.is_deleted ? 'delete' as const : 'upsert' as const,
+    element: JSON.parse(r.data),
+    sync_version: r.sync_version
+  }));
 }
 
 // Given a tenant ID, return its default project (creating one if needed)
@@ -227,11 +280,12 @@ export function hasElement(id: string, projectId?: string): boolean {
   return !!row;
 }
 
-export function setElement(id: string, element: ServerElement, projectId?: string): void {
+export function setElement(id: string, element: ServerElement, projectId?: string): number {
   const p = pid(projectId);
   const now = new Date().toISOString();
   const data = JSON.stringify(element);
   const labelText = extractLabelText(element);
+  const sv = incrementSyncVersion(p);
   const existing = db.prepare(
     'SELECT version, is_deleted FROM elements WHERE id = ? AND project_id = ?'
   ).get(id, p) as { version: number; is_deleted: number } | undefined;
@@ -239,21 +293,22 @@ export function setElement(id: string, element: ServerElement, projectId?: strin
   if (existing) {
     const newVersion = existing.is_deleted ? 1 : (existing.version + 1);
     db.prepare(`
-      UPDATE elements SET type = ?, data = ?, label_text = ?, updated_at = ?, version = ?, is_deleted = 0
+      UPDATE elements SET type = ?, data = ?, label_text = ?, updated_at = ?, version = ?, is_deleted = 0, sync_version = ?
       WHERE id = ? AND project_id = ?
-    `).run(element.type, data, labelText, now, newVersion, id, p);
+    `).run(element.type, data, labelText, now, newVersion, sv, id, p);
 
     recordVersion(id, newVersion, data, existing.is_deleted ? 'create' : 'update', p);
     updateFts(id, labelText, element.type);
   } else {
     db.prepare(`
-      INSERT INTO elements (id, project_id, type, data, label_text, created_at, updated_at, version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(id, p, element.type, data, labelText, now, now);
+      INSERT INTO elements (id, project_id, type, data, label_text, created_at, updated_at, version, sync_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `).run(id, p, element.type, data, labelText, now, now, sv);
 
     recordVersion(id, 1, data, 'create', p);
     insertFts(id, labelText, element.type);
   }
+  return sv;
 }
 
 export function deleteElement(id: string, projectId?: string): boolean {
@@ -265,10 +320,11 @@ export function deleteElement(id: string, projectId?: string): boolean {
   if (!existing) return false;
 
   const newVersion = existing.version + 1;
+  const sv = incrementSyncVersion(p);
   db.prepare(`
-    UPDATE elements SET is_deleted = 1, version = ?, updated_at = ?
+    UPDATE elements SET is_deleted = 1, version = ?, updated_at = ?, sync_version = ?
     WHERE id = ? AND project_id = ?
-  `).run(newVersion, new Date().toISOString(), id, p);
+  `).run(newVersion, new Date().toISOString(), sv, id, p);
 
   recordVersion(id, newVersion, existing.data, 'delete', p);
   deleteFts(id);
@@ -293,14 +349,15 @@ export function clearElements(projectId?: string): number {
   const p = pid(projectId);
   const now = new Date().toISOString();
   const elements = getAllElements(p);
+  const sv = incrementSyncVersion(p);
 
   const stmt = db.prepare(`
-    UPDATE elements SET is_deleted = 1, version = version + 1, updated_at = ?
+    UPDATE elements SET is_deleted = 1, version = version + 1, updated_at = ?, sync_version = ?
     WHERE project_id = ? AND is_deleted = 0
   `);
 
   const clearTx = db.transaction(() => {
-    const info = stmt.run(now, p);
+    const info = stmt.run(now, sv, p);
     for (const el of elements) {
       recordVersion(el.id, (el.version || 1) + 1, JSON.stringify(el), 'delete', p);
       deleteFts(el.id);
