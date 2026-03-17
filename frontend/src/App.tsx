@@ -260,6 +260,12 @@ function App(): JSX.Element {
     }
   }
 
+  const sendHello = (tenantId: string): void => {
+    const ws = websocketRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ type: 'hello', tenantId }))
+  }
+
   const sendAck = (msgId: string | undefined, status: 'applied' | 'partial' | 'failed', elementCount?: number, expectedCount?: number): void => {
     if (!msgId) return
     const ws = websocketRef.current
@@ -450,6 +456,32 @@ function App(): JSX.Element {
           console.log('Received image export request', data)
           if (data.requestId) {
             try {
+              // Viewport capture: grab the rendered canvas DOM element directly
+              // This captures exactly what the user sees, respecting zoom/scroll.
+              if (data.captureViewport && data.format !== 'svg') {
+                const canvasEl = document.querySelector('.excalidraw__canvas') as HTMLCanvasElement
+                  ?? document.querySelector('canvas') as HTMLCanvasElement
+                if (canvasEl) {
+                  const dataUrl = canvasEl.toDataURL('image/png')
+                  const base64 = dataUrl.split(',')[1]
+                  if (base64) {
+                    await fetch('/api/export/image/result', {
+                      method: 'POST',
+                      headers: tenantHeaders(),
+                      body: JSON.stringify({
+                        requestId: data.requestId,
+                        format: 'png',
+                        data: base64
+                      })
+                    })
+                    console.log('Viewport screenshot captured for request', data.requestId)
+                    break
+                  }
+                }
+                // Fall through to exportToBlob if canvas capture failed
+                console.warn('Viewport canvas capture failed, falling back to exportToBlob')
+              }
+
               const elements = api.getSceneElements()
               const appState = api.getAppState()
               const files = api.getFiles()
@@ -547,13 +579,13 @@ function App(): JSX.Element {
               if (data.scrollToContent) {
                 const allElements = api.getSceneElements()
                 if (allElements.length > 0) {
-                  api.scrollToContent(allElements, { fitToViewport: true, animate: true })
+                  api.scrollToContent(allElements, { fitToViewport: true, animate: false })
                 }
               } else if (data.scrollToElementId) {
                 const allElements = api.getSceneElements()
                 const targetElement = allElements.find(el => el.id === data.scrollToElementId)
                 if (targetElement) {
-                  api.scrollToContent([targetElement], { fitToViewport: false, animate: true })
+                  api.scrollToContent([targetElement], { fitToViewport: false, animate: false })
                 } else {
                   throw new Error(`Element ${data.scrollToElementId} not found`)
                 }
@@ -645,8 +677,8 @@ function App(): JSX.Element {
           console.log('Tenant switched:', data.tenant)
           if (data.tenant) {
             const incoming = data.tenant as TenantInfo
-            // Only reload if the switch came from an external source (MCP tool)
-            // and we aren't already on that tenant (UI-driven switch handles its own reload)
+            // Send hello to register WS connection under the correct tenant scope
+            sendHello(incoming.id)
             if (incoming.id !== activeTenantIdRef.current) {
               activeTenantIdRef.current = incoming.id
               setActiveTenant(incoming)
@@ -659,6 +691,17 @@ function App(): JSX.Element {
             } else {
               setActiveTenant(incoming)
             }
+          }
+          break
+
+        case 'hello_ack':
+          console.log('Hello acknowledged by server:', data.tenantId, data.projectId)
+          if (data.elements && Array.isArray(data.elements) && data.elements.length > 0) {
+            const converted = convertToExcalidrawElements(data.elements)
+            api.updateScene({
+              elements: converted,
+              captureUpdate: CaptureUpdateAction.NEVER
+            })
           }
           break
 

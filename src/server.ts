@@ -198,6 +198,43 @@ async function broadcastWithAck(
   };
 }
 
+// ── Per-Scope Broadcast Serialization ────────────────────────────────────
+// When multiple MCP tool calls fire in parallel (e.g., parallel create_element),
+// each produces a broadcastWithAck. Without serialization, the frontend receives
+// overlapping WS messages and getSceneElements() returns stale snapshots,
+// causing earlier elements to be clobbered.
+// This queue ensures broadcasts within the same scope are sent one at a time,
+// waiting for the previous ACK before sending the next.
+const scopeBroadcastQueues = new Map<string, Promise<AckResult>>();
+
+async function serializedBroadcastWithAck(
+  tenantId: string,
+  projectId: string,
+  message: WebSocketMessage,
+  timeoutMs: number = 3000
+): Promise<AckResult> {
+  const scopeKey = `${tenantId}/${projectId}`;
+
+  // Chain onto the previous broadcast for this scope (or start fresh)
+  const previous = scopeBroadcastQueues.get(scopeKey) ?? Promise.resolve({} as AckResult);
+
+  const current = previous
+    // Wait for previous to settle (success or failure) before sending ours
+    .catch(() => {})
+    .then(() => broadcastWithAck(tenantId, projectId, message, timeoutMs));
+
+  scopeBroadcastQueues.set(scopeKey, current);
+
+  try {
+    return await current;
+  } finally {
+    // Clean up if we're still the tail of the queue
+    if (scopeBroadcastQueues.get(scopeKey) === current) {
+      scopeBroadcastQueues.delete(scopeKey);
+    }
+  }
+}
+
 // Legacy broadcast: sends to ALL connected clients (used for global messages
 // like tenant_switched that aren't scoped to a single project).
 function broadcast(message: WebSocketMessage): void {
@@ -261,8 +298,8 @@ wss.on('connection', (ws: WebSocket) => {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'hello') {
         const helloTenantId = msg.tenantId as string;
-        const helloProjectId = msg.projectId as string;
-        if (helloTenantId && helloProjectId) {
+        const helloProjectId = (msg.projectId as string) || getDefaultProjectForTenant(msg.tenantId) || `${msg.tenantId}-default`;
+        if (helloTenantId) {
           // Move connection to the correct scope
           moveConnection(ws, helloTenantId, helloProjectId);
           logger.info(`Client identified: tenant=${helloTenantId} project=${helloProjectId}`);
@@ -429,7 +466,7 @@ app.post('/api/elements', async (req: Request, res: Response) => {
       element: element
     };
     (message as any).sync_version = sv;
-    const ackResult = await broadcastWithAck(scope.tenantId, scope.projectId, message);
+    const ackResult = await serializedBroadcastWithAck(scope.tenantId, scope.projectId, message);
 
     res.json({
       success: true,
@@ -490,7 +527,7 @@ app.put('/api/elements/:id', async (req: Request, res: Response) => {
       element: updatedElement
     };
     (message as any).sync_version = sv;
-    const ackResult = await broadcastWithAck(scope.tenantId, scope.projectId, message);
+    const ackResult = await serializedBroadcastWithAck(scope.tenantId, scope.projectId, message);
 
     res.json({
       success: true,
@@ -820,7 +857,7 @@ app.post('/api/elements/batch', async (req: Request, res: Response) => {
       elements: createdElements
     };
     (message as any).sync_version = latestSyncVersion;
-    const ackResult = await broadcastWithAck(scope.tenantId, scope.projectId, message);
+    const ackResult = await serializedBroadcastWithAck(scope.tenantId, scope.projectId, message);
 
     res.json({
       success: true,
@@ -1101,7 +1138,7 @@ const pendingExports = new Map<string, PendingExport>();
 
 app.post('/api/export/image', (req: Request, res: Response) => {
   try {
-    const { format, background } = req.body;
+    const { format, background, captureViewport } = req.body;
 
     if (!format || !['png', 'svg'].includes(format)) {
       return res.status(400).json({
@@ -1133,7 +1170,8 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       type: 'export_image_request',
       requestId,
       format,
-      background: background ?? true
+      background: background ?? true,
+      captureViewport: captureViewport ?? false
     });
 
     exportPromise

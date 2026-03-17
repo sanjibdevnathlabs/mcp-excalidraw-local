@@ -208,9 +208,25 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
     return result as SyncResponse;
     
   } catch (error) {
-    logger.warn(`Canvas sync failed for ${operation}:`, (error as Error).message);
-    // Don't throw - we want MCP operations to work even if canvas is unavailable
-    return null;
+    const err = error as Error & { cause?: { code?: string } };
+    // Distinguish network errors (canvas truly unavailable) from API errors (canvas responded with error).
+    // Network errors: return null so MCP can degrade gracefully.
+    // API errors: re-throw so the caller gets the actual error message.
+    const isNetworkError = err.message?.includes('fetch failed') ||
+      err.message?.includes('ECONNREFUSED') ||
+      err.cause?.code === 'ECONNREFUSED' ||
+      err.cause?.code === 'ENOTFOUND' ||
+      err.message?.includes('network') ||
+      err.name === 'TypeError'; // fetch throws TypeError for network failures
+
+    if (isNetworkError) {
+      logger.warn(`Canvas unavailable for ${operation}:`, err.message);
+      return null;
+    }
+
+    // API error — propagate the actual error message
+    logger.warn(`Canvas API error for ${operation}:`, err.message);
+    throw error;
   }
 }
 
@@ -1043,7 +1059,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const element: ServerElement = {
           id,
           ...elementProps,
-          ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
+          fontFamily: normalizedFont ?? USER_PREFS.fontFamily,
+          roughness: elementProps.roughness ?? USER_PREFS.roughness,
+          fontSize: elementProps.fontSize ?? USER_PREFS.fontSize,
+          strokeWidth: elementProps.strokeWidth ?? USER_PREFS.strokeWidth,
           points: elementProps.points ? normalizePoints(elementProps.points) : undefined,
           ...(startElementId ? { start: { id: startElementId } } : {}),
           ...(endElementId ? { end: { id: endElementId } } : {}),
@@ -1549,7 +1568,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           const element: ServerElement = {
             id,
             ...elementProps,
-            ...(normalizedFont !== undefined ? { fontFamily: normalizedFont } : {}),
+            fontFamily: normalizedFont ?? USER_PREFS.fontFamily,
+            roughness: elementProps.roughness ?? USER_PREFS.roughness,
+            fontSize: elementProps.fontSize ?? USER_PREFS.fontSize,
+            strokeWidth: elementProps.strokeWidth ?? USER_PREFS.strokeWidth,
             points: elementProps.points ? normalizePoints(elementProps.points) : undefined,
             ...(startElementId ? { start: { id: startElementId } } : {}),
             ...(endElementId ? { end: { id: endElementId } } : {}),
@@ -2169,7 +2191,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           headers: canvasHeaders(),
           body: JSON.stringify({
             format: 'png',
-            background: params.background ?? true
+            background: params.background ?? true,
+            captureViewport: true
           })
         });
 
