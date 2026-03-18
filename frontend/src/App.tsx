@@ -185,10 +185,11 @@ function App(): JSX.Element {
     try {
       const response = await fetch('/api/elements', { headers: tenantHeaders() })
       const result: ApiResponse = await response.json()
-      
+
       if (result.success && result.elements) {
         if (result.elements.length === 0) {
           excalidrawAPI?.updateScene({ elements: [] })
+          lastSyncedElementsRef.current = new Map()
           return
         }
         const cleanedElements = result.elements.map(cleanElementForExcalidraw)
@@ -200,6 +201,30 @@ function App(): JSX.Element {
           const convertedElements = convertElementsPreservingImageProps(cleanedElements)
           excalidrawAPI?.updateScene({ elements: convertedElements })
         }
+
+        // Populate sync baseline so deletions are detected on next sync
+        const baselineMap = new Map<string, ServerElement>()
+        for (const el of result.elements) {
+          baselineMap.set(el.id, el)
+        }
+        lastSyncedElementsRef.current = baselineMap
+      }
+
+      // Fetch current sync version so delta sync works correctly
+      try {
+        const versionRes = await fetch('/api/sync/version', { headers: tenantHeaders() })
+        const versionData = await versionRes.json()
+        if (versionData.success && typeof versionData.syncVersion === 'number') {
+          lastSyncVersionRef.current = versionData.syncVersion
+          lastReceivedSyncVersionRef.current = versionData.syncVersion
+          localStorage.setItem('excalidraw-last-sync-version', String(versionData.syncVersion))
+        }
+      } catch {}
+
+      // Set hash baseline so auto-sync doesn't immediately re-sync unchanged content
+      if (excalidrawAPI) {
+        const sceneElements = excalidrawAPI.getSceneElements()
+        lastSyncedHashRef.current = computeElementHash(sceneElements)
       }
 
       // Also load files (image data)
@@ -313,6 +338,16 @@ function App(): JSX.Element {
         lastReceivedSyncVersionRef.current = data.currentSyncVersion
         lastSyncVersionRef.current = data.currentSyncVersion
         localStorage.setItem('excalidraw-last-sync-version', String(data.currentSyncVersion))
+        // Update sync baseline so deletion detection works after resync
+        if (api) {
+          const activeElements = api.getSceneElements().filter(el => !el.isDeleted)
+          const baselineMap = new Map<string, any>()
+          for (const el of normalizeForBackend(activeElements)) {
+            baselineMap.set(el.id, el)
+          }
+          lastSyncedElementsRef.current = baselineMap
+          lastSyncedHashRef.current = computeElementHash(api.getSceneElements())
+        }
         console.log(`Delta resync complete: received ${data.serverChanges.length} changes, now at v${data.currentSyncVersion}`)
       }
     } catch (err) {
@@ -353,6 +388,12 @@ function App(): JSX.Element {
               elements: convertedElements,
               captureUpdate: CaptureUpdateAction.NEVER
             })
+            // Update sync baseline for deletion detection
+            const initBaseline = new Map<string, any>()
+            for (const el of data.elements) {
+              initBaseline.set(el.id, el)
+            }
+            lastSyncedElementsRef.current = initBaseline
           }
           break
 
@@ -702,6 +743,14 @@ function App(): JSX.Element {
               elements: converted,
               captureUpdate: CaptureUpdateAction.NEVER
             })
+            // Update sync baseline for deletion detection
+            const helloBaseline = new Map<string, any>()
+            for (const el of data.elements) {
+              helloBaseline.set(el.id, el)
+            }
+            lastSyncedElementsRef.current = helloBaseline
+          } else if (data.elements && data.elements.length === 0) {
+            lastSyncedElementsRef.current = new Map()
           }
           break
 

@@ -1841,10 +1841,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           } catch {}
         }
 
-        if (params.mode === 'replace') {
-          await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, { method: 'DELETE', headers: canvasHeaders() });
-        }
-
         // Batch create the imported elements
         const elementsToCreate = importElements.map(el => ({
           ...el,
@@ -1854,7 +1850,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           version: 1
         }));
 
-        const canvasElements = await batchCreateElementsOnCanvas(elementsToCreate);
+        if (params.mode === 'replace') {
+          // Backup current elements before clearing to prevent data loss
+          const backupResp = await fetch(`${EXPRESS_SERVER_URL}/api/elements`, { headers: canvasHeaders() });
+          const backupData = await backupResp.json() as ApiResponse;
+          const backupElements = backupData.elements || [];
+
+          await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, { method: 'DELETE', headers: canvasHeaders() });
+
+          try {
+            await batchCreateElementsOnCanvas(elementsToCreate);
+          } catch (createError) {
+            // Restore backup atomically to prevent data loss
+            logger.error('Import failed after clear, restoring backup:', (createError as Error).message);
+            if (backupElements.length > 0) {
+              await fetch(`${EXPRESS_SERVER_URL}/api/elements/sync`, {
+                method: 'POST',
+                headers: canvasHeaders(),
+                body: JSON.stringify({ elements: backupElements })
+              });
+            }
+            throw new Error(`Import failed: ${(createError as Error).message}. Previous ${backupElements.length} elements have been restored.`);
+          }
+        } else {
+          await batchCreateElementsOnCanvas(elementsToCreate);
+        }
 
         return {
           content: [{
@@ -1926,24 +1946,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         logger.info('Duplicating elements via MCP', { count: params.elementIds.length });
 
-        const duplicates: ServerElement[] = [];
+        // Build ID map first so binding references can be remapped
+        const idMap = new Map<string, string>();
+        const originals: ServerElement[] = [];
         for (const id of params.elementIds) {
           const original = await getElementFromCanvas(id);
           if (!original) {
             logger.warn(`Element ${id} not found, skipping duplicate`);
             continue;
           }
+          const newId = generateId();
+          idMap.set(id, newId);
+          originals.push(original);
+        }
 
+        const duplicates: ServerElement[] = [];
+        for (const original of originals) {
           const { createdAt, updatedAt, version, syncedAt, source, syncTimestamp, ...rest } = original;
           const duplicate: ServerElement = {
             ...rest,
-            id: generateId(),
+            id: idMap.get(original.id) || generateId(),
             x: original.x + offsetX,
             y: original.y + offsetY,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             version: 1
           };
+
+          // Remap binding references to point to duplicated elements
+          const dup = duplicate as any;
+          if (dup.startElementId && idMap.has(dup.startElementId)) {
+            dup.startElementId = idMap.get(dup.startElementId);
+          }
+          if (dup.endElementId && idMap.has(dup.endElementId)) {
+            dup.endElementId = idMap.get(dup.endElementId);
+          }
+          if (dup.start?.id && idMap.has(dup.start.id)) {
+            dup.start = { ...dup.start, id: idMap.get(dup.start.id) };
+          }
+          if (dup.end?.id && idMap.has(dup.end.id)) {
+            dup.end = { ...dup.end, id: idMap.get(dup.end.id) };
+          }
+          if (Array.isArray(dup.boundElements)) {
+            dup.boundElements = dup.boundElements.map((be: any) => ({
+              ...be,
+              id: idMap.has(be.id) ? idMap.get(be.id) : be.id
+            }));
+          }
+          if (dup.containerId && idMap.has(dup.containerId)) {
+            dup.containerId = idMap.get(dup.containerId);
+          }
+
           duplicates.push(duplicate);
         }
 
@@ -1998,10 +2051,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         const data = await response.json() as { success: boolean; snapshot: { name: string; elements: ServerElement[]; createdAt: string } };
 
+        // Backup current elements before clearing to prevent data loss
+        const backupResp = await fetch(`${EXPRESS_SERVER_URL}/api/elements`, { headers: canvasHeaders() });
+        const backupData = await backupResp.json() as ApiResponse;
+        const backupElements = backupData.elements || [];
+
         await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, { method: 'DELETE', headers: canvasHeaders() });
 
-        // Restore elements
-        const canvasElements = await batchCreateElementsOnCanvas(data.snapshot.elements);
+        // Restore elements from snapshot
+        try {
+          await batchCreateElementsOnCanvas(data.snapshot.elements);
+        } catch (createError) {
+          // Restore backup atomically to prevent data loss
+          logger.error('Snapshot restore failed after clear, restoring backup:', (createError as Error).message);
+          if (backupElements.length > 0) {
+            await fetch(`${EXPRESS_SERVER_URL}/api/elements/sync`, {
+              method: 'POST',
+              headers: canvasHeaders(),
+              body: JSON.stringify({ elements: backupElements })
+            });
+          }
+          throw new Error(`Snapshot restore failed: ${(createError as Error).message}. Previous ${backupElements.length} elements have been restored.`);
+        }
 
         return {
           content: [{
